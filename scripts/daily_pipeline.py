@@ -18,13 +18,14 @@ Usage:
 import argparse
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from src.db import SessionLocal  # noqa: E402
+from src.models.schema import Symbol  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,23 +34,33 @@ logging.basicConfig(
 logger = logging.getLogger("daily_pipeline")
 
 
+def _get_active_symbols(db) -> list[str]:
+    return [
+        row.symbol for row in
+        db.query(Symbol).filter(Symbol.is_active.is_(True)).all()
+    ]
+
+
 def step_1_calendar_sync(db):
     """Sync market calendar for upcoming sessions."""
-    from src.calendar.service import sync_calendar
+    from src.calendar.service import sync_calendar_to_db
     logger.info("Step 1: Calendar sync")
     try:
-        sync_calendar(db)
-        logger.info("  Calendar sync complete")
+        today = date.today()
+        count = sync_calendar_to_db(db, today - timedelta(days=7), today + timedelta(days=30))
+        logger.info(f"  Calendar sync complete: {count} entries")
     except Exception:
         logger.exception("  Calendar sync failed")
 
 
 def step_2_ingest_market(db):
     """Ingest latest market bars."""
-    from src.pipelines.ingest_market import ingest_daily_bars
+    from src.pipelines.ingest_market import ingest_universe
     logger.info("Step 2: Market data ingestion")
     try:
-        result = ingest_daily_bars(db)
+        symbols = _get_active_symbols(db)
+        today = date.today()
+        result = ingest_universe(db, symbols, today - timedelta(days=5), today)
         logger.info(f"  Market ingestion complete: {result}")
     except Exception:
         logger.exception("  Market ingestion failed")
@@ -60,7 +71,9 @@ def step_3_ingest_news(db):
     from src.pipelines.ingest_news import ingest_news
     logger.info("Step 3: News ingestion")
     try:
-        result = ingest_news(db)
+        symbols = _get_active_symbols(db)
+        today = date.today()
+        result = ingest_news(db, symbols, today - timedelta(days=2), today)
         logger.info(f"  News ingestion complete: {result}")
     except Exception:
         logger.exception("  News ingestion failed")
@@ -71,7 +84,8 @@ def step_4_ingest_macro(db):
     from src.pipelines.ingest_macro import ingest_macro
     logger.info("Step 4: Macro data ingestion")
     try:
-        result = ingest_macro(db)
+        today = date.today()
+        result = ingest_macro(db, today - timedelta(days=30), today)
         logger.info(f"  Macro ingestion complete: {result}")
     except Exception:
         logger.exception("  Macro ingestion failed")
@@ -80,13 +94,9 @@ def step_4_ingest_macro(db):
 def step_5_generate_features(db):
     """Generate features for latest session (incremental)."""
     from src.features.engine import generate_features, save_snapshots
-    from src.models.schema import Symbol
     logger.info("Step 5: Feature generation")
     try:
-        symbols = [
-            row.symbol for row in
-            db.query(Symbol).filter(Symbol.is_active.is_(True)).all()
-        ]
+        symbols = _get_active_symbols(db)
         snapshots = generate_features(db, symbols, target_dates=None)
         saved = save_snapshots(db, snapshots)
         logger.info(f"  Features generated: {saved} snapshots")

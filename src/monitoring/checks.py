@@ -8,7 +8,7 @@ Automated health checks per ENG-SPEC 15:
 """
 
 import logging
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 
 import numpy as np
 from sqlalchemy import text

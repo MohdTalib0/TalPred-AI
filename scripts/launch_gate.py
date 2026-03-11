@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.db import SessionLocal  # noqa: E402
-from src.ml.promotion import get_production_model, rollback_model  # noqa: E402
+from src.ml.promotion import get_production_model  # noqa: E402
 from src.monitoring.checks import run_all_checks  # noqa: E402
 
 from sqlalchemy import text  # noqa: E402

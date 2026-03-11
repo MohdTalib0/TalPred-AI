@@ -9,17 +9,16 @@ Portfolio policy:
   daily rebalance, configurable transaction costs + slippage
 """
 
-import hashlib
 import logging
 import uuid
-from datetime import UTC, date, datetime
+from datetime import date
 
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from src.models.schema import PaperTrade, Prediction, SimulationRun
+from src.models.schema import PaperTrade, SimulationRun
 
 logger = logging.getLogger(__name__)
 
