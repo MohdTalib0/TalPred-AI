@@ -1,0 +1,28 @@
+confidence:
+  min_trade_threshold: 0.60
+  top_n_per_day: 20
+
+portfolio:
+  max_position: 0.05
+
+retraining:
+  cadence: "weekly"
+  training_window_years: 3
+  fallback_cadence: "biweekly"
+
+leakage_guardrails:
+  max_accuracy_before_audit: 0.65
+
+feature_drift:
+  psi_warning: 0.15
+  psi_critical: 0.25
+
+data_quality:
+  missing_bars_30d_max_pct: 0.01
+  ingestion_failures_7d_max: 3
+  data_latency_max_hours: 6
+
+regime:
+  sp500_momentum_days: 200
+  sideways_threshold_pct: 0.02
+  vix_high_vol_threshold: 20

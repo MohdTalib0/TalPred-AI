@@ -1,0 +1,30 @@
+universe:
+  name: "US Large Cap 200"
+  version: "v1"
+  filters:
+    market_cap_min: 10_000_000_000
+    avg_daily_volume_min: 1_000_000
+    exchanges:
+      - NYSE
+      - NASDAQ
+  seed_symbols:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - NVDA
+    - META
+    - TSLA
+    - BRK-B
+    - JPM
+    - V
+    - JNJ
+    - UNH
+    - XOM
+    - PG
+    - MA
+    - HD
+    - CVX
+    - MRK
+    - ABBV
+    - LLY

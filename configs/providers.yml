@@ -1,0 +1,32 @@
+market:
+  primary: "yfinance"
+  fallback: "finnhub"
+  backfill_years: 5
+
+news:
+  daily: "newsapi"
+  backfill: "gdelt"
+  newsapi_max_daily_requests: 100
+
+macro:
+  primary: "fred"
+  series:
+    - id: "DFF"
+      name: "Federal Funds Rate"
+    - id: "CPIAUCSL"
+      name: "CPI"
+    - id: "DCOILWTICO"
+      name: "WTI Crude Oil"
+    - id: "DTWEXBGS"
+      name: "Trade Weighted USD"
+    - id: "VIXCLS"
+      name: "VIX"
+
+upgrade_triggers:
+  missing_bars_threshold: 0.01
+  ingestion_failures_threshold: 3
+  latency_hours_threshold: 6
+
+paid_providers:
+  market: "polygon"
+  news: "benzinga"
