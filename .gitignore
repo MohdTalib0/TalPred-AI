@@ -22,6 +22,9 @@ data/features/*
 mlruns/
 mlartifacts/
 
+# DVC tracked datasets (large files)
+/data/datasets/
+
 .venv/
 venv/
 env/

@@ -1,0 +1,7 @@
+[core]
+    remote = dagshub
+['remote "dagshub"']
+    url = https://dagshub.com/mohammad.talib319/TalPred-AI.dvc
+    auth = basic
+    user = mohammad.talib319
+    password = 11891300@Talib

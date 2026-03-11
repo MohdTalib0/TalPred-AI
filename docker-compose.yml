@@ -5,20 +5,43 @@ services:
       - "8000:8000"
     env_file:
       - .env
-    volumes:
-      - .:/app
+    environment:
+      - APP_ENV=staging
+    restart: unless-stopped
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - redis-data:/data
 
   worker:
     build: .
     command: prefect worker start --pool default-agent-pool
     env_file:
       - .env
-    volumes:
-      - .:/app
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  scheduler:
+    build: .
+    command: python -m scripts.daily_pipeline
+    env_file:
+      - .env
+    restart: "no"
+    depends_on:
+      - api
+
+volumes:
+  redis-data:

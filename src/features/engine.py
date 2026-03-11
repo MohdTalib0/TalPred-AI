@@ -37,7 +37,7 @@ def _to_float(val) -> float | None:
 
 logger = logging.getLogger(__name__)
 
-MAX_LOOKBACK_DAYS = 220  # 200d momentum + buffer
+MAX_LOOKBACK_DAYS = 310  # ~200 trading days + buffer for weekends/holidays
 
 
 def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -100,10 +100,10 @@ def load_macro_latest(db: Session) -> dict:
 
 
 def load_sp500_data(db: Session, lookback_days: int = MAX_LOOKBACK_DAYS) -> pd.Series:
-    """Load SPY as benchmark proxy for S&P 500."""
+    """Load SPY (S&P 500 ETF) as benchmark."""
     result = db.execute(text("""
         SELECT date, close FROM market_bars_daily
-        WHERE symbol = 'GOOGL'
+        WHERE symbol = 'SPY'
         AND date >= CURRENT_DATE - :lookback
         ORDER BY date
     """), {"lookback": lookback_days})
@@ -245,8 +245,12 @@ def generate_features(
                 if ts in sp500_series.index and sp500_series.index.get_loc(ts) > 0:
                     loc = sp500_series.index.get_loc(ts)
                     sp_ret = (sp500_series.iloc[loc] / sp500_series.iloc[loc - 1]) - 1
-                    stock_ret = row.get("momentum_5d", 0) or 0
-                    benchmark_rel = _to_float(stock_ret - sp_ret)
+
+                    row_idx = sym_df.index[sym_df["date"].dt.date == td]
+                    row_loc = sym_df.index.get_loc(row_idx[0])
+                    if row_loc > 0:
+                        stock_ret = (sym_df["close"].iloc[row_loc] / sym_df["close"].iloc[row_loc - 1]) - 1
+                        benchmark_rel = _to_float(stock_ret - sp_ret)
 
             snapshots.append({
                 "snapshot_id": _snapshot_id(symbol, td),

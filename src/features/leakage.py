@@ -84,12 +84,13 @@ def as_of_join_news_sentiment(
         FROM news_events ne
         JOIN news_symbol_mapping nsm ON ne.event_id = nsm.event_id
         WHERE nsm.symbol = :symbol
-          AND ne.published_time < :as_of_date
-          AND ne.published_time >= :as_of_date - INTERVAL ':hours hours'
+          AND ne.published_time < :as_of_date::timestamp
+          AND ne.published_time >= :as_of_date::timestamp - make_interval(hours => :hours)
           AND ne.sentiment_score IS NOT NULL
-    """.replace(":hours", str(lookback_hours))), {
+    """), {
         "symbol": symbol,
         "as_of_date": str(as_of_date),
+        "hours": lookback_hours,
     })
 
     row = result.fetchone()

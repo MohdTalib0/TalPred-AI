@@ -5,10 +5,10 @@ isotonic regression so that confidence scores are reliable for trading threshold
 """
 
 import logging
-import pickle
 
 import mlflow
 import numpy as np
+import pandas as pd
 import xgboost as xgb
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.metrics import brier_score_loss
@@ -20,39 +20,53 @@ logger = logging.getLogger(__name__)
 
 def calibrate_model(
     model: xgb.XGBClassifier,
-    df_calibration: "pd.DataFrame",
+    df_calibration: pd.DataFrame,
     method: str = "isotonic",
+    train_medians: pd.Series | None = None,
 ) -> dict:
     """Calibrate a trained model using held-out calibration data.
+
+    Splits the calibration set into a fit portion (70%) for fitting the
+    calibrator and an eval portion (30%) for unbiased metric reporting.
 
     Args:
         model: Trained XGBClassifier
         df_calibration: Calibration dataset (separate from train/val)
         method: "sigmoid" (Platt) or "isotonic"
+        train_medians: Medians from training set for NaN filling
 
     Returns dict with calibrated model, metrics, and calibration curve data.
     """
-    X_cal, y_cal = prepare_features(df_calibration)
+    split_idx = int(len(df_calibration) * 0.7)
+    df_fit = df_calibration.iloc[:split_idx]
+    df_eval = df_calibration.iloc[split_idx:]
 
-    raw_probs = model.predict_proba(X_cal)[:, 1]
-    raw_brier = brier_score_loss(y_cal, raw_probs)
+    X_fit, y_fit, medians = prepare_features(df_fit, fill_medians=train_medians)
+    X_eval, y_eval, _ = prepare_features(df_eval, fill_medians=medians)
+
+    common_cols = [c for c in X_fit.columns if c in X_eval.columns]
+    X_fit, X_eval = X_fit[common_cols], X_eval[common_cols]
+
+    raw_probs = model.predict_proba(X_eval)[:, 1]
+    raw_brier = brier_score_loss(y_eval, raw_probs)
 
     calibrated = CalibratedClassifierCV(model, method=method, cv="prefit")
-    calibrated.fit(X_cal, y_cal)
+    calibrated.fit(X_fit, y_fit)
 
-    cal_probs = calibrated.predict_proba(X_cal)[:, 1]
-    cal_brier = brier_score_loss(y_cal, cal_probs)
+    cal_probs = calibrated.predict_proba(X_eval)[:, 1]
+    cal_brier = brier_score_loss(y_eval, cal_probs)
 
-    prob_true_raw, prob_pred_raw = calibration_curve(y_cal, raw_probs, n_bins=10, strategy="uniform")
-    prob_true_cal, prob_pred_cal = calibration_curve(y_cal, cal_probs, n_bins=10, strategy="uniform")
+    prob_true_raw, prob_pred_raw = calibration_curve(y_eval, raw_probs, n_bins=10, strategy="uniform")
+    prob_true_cal, prob_pred_cal = calibration_curve(y_eval, cal_probs, n_bins=10, strategy="uniform")
 
     raw_ece = _expected_calibration_error(prob_true_raw, prob_pred_raw)
     cal_ece = _expected_calibration_error(prob_true_cal, prob_pred_cal)
 
-    logger.info(f"Calibration ({method}):")
+    logger.info(f"Calibration ({method}), eval on {len(df_eval)} held-out rows:")
     logger.info(f"  Raw  - Brier: {raw_brier:.4f}, ECE: {raw_ece:.4f}")
     logger.info(f"  Cal  - Brier: {cal_brier:.4f}, ECE: {cal_ece:.4f}")
-    logger.info(f"  Improvement: Brier {(raw_brier - cal_brier) / raw_brier * 100:.1f}%")
+    improvement = (raw_brier - cal_brier) / raw_brier * 100 if raw_brier > 0 else 0
+    logger.info(f"  Improvement: Brier {improvement:.1f}%")
 
     return {
         "calibrated_model": calibrated,
@@ -62,7 +76,7 @@ def calibrate_model(
             "calibrated_brier": cal_brier,
             "raw_ece": raw_ece,
             "calibrated_ece": cal_ece,
-            "brier_improvement_pct": (raw_brier - cal_brier) / raw_brier * 100,
+            "brier_improvement_pct": improvement,
         },
         "calibration_curve": {
             "raw": {"prob_true": prob_true_raw.tolist(), "prob_pred": prob_pred_raw.tolist()},

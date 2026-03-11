@@ -59,8 +59,8 @@ def walk_forward_backtest(
             start_idx += step_days
             continue
 
-        X_train, y_train = prepare_features(train_df)
-        X_test, y_test = prepare_features(test_df)
+        X_train, y_train, train_medians = prepare_features(train_df)
+        X_test, y_test, _ = prepare_features(test_df, fill_medians=train_medians)
 
         common_cols = [c for c in X_train.columns if c in X_test.columns]
         X_train = X_train[common_cols]

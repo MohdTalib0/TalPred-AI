@@ -21,6 +21,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 US_LARGE_CAP_200 = [
+    # Benchmark ETF (S&P 500 proxy)
+    "SPY",
     # Technology
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "ORCL", "CSCO",
     "ADBE", "CRM", "AMD", "INTC", "QCOM", "TXN", "INTU", "AMAT", "NOW", "IBM",

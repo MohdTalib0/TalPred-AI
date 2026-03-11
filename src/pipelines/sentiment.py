@@ -5,7 +5,7 @@ scores them via OpenRouter, and stores aggregated sentiment per symbol per date.
 """
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -22,6 +22,9 @@ def get_recent_headlines(
     lookback_hours: int = 24,
 ) -> list[str]:
     """Get headlines for a symbol from the last N hours before target_date."""
+    end_ts = datetime.combine(target_date, datetime.min.time())
+    start_ts = end_ts - timedelta(hours=lookback_hours)
+
     result = db.execute(text("""
         SELECT ne.headline
         FROM news_events ne
@@ -33,8 +36,8 @@ def get_recent_headlines(
         LIMIT 50
     """), {
         "symbol": symbol,
-        "start_time": f"{target_date - timedelta(hours=lookback_hours)}",
-        "end_time": f"{target_date}",
+        "start_time": start_ts.isoformat(),
+        "end_time": end_ts.isoformat(),
     })
     return [row[0] for row in result.fetchall()]
 
@@ -45,6 +48,9 @@ def get_general_market_headlines(
     lookback_hours: int = 24,
 ) -> list[str]:
     """Get recent general market headlines (not symbol-specific)."""
+    end_ts = datetime.combine(target_date, datetime.min.time())
+    start_ts = end_ts - timedelta(hours=lookback_hours)
+
     result = db.execute(text("""
         SELECT headline
         FROM news_events
@@ -53,8 +59,8 @@ def get_general_market_headlines(
         ORDER BY published_time DESC
         LIMIT 100
     """), {
-        "start_time": f"{target_date - timedelta(hours=lookback_hours)}",
-        "end_time": f"{target_date}",
+        "start_time": start_ts.isoformat(),
+        "end_time": end_ts.isoformat(),
     })
     return [row[0] for row in result.fetchall()]
 
