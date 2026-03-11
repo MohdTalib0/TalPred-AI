@@ -10,10 +10,9 @@ Runs after market close once features are generated:
 
 import hashlib
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import mlflow
-import numpy as np
 import pandas as pd
 import shap
 from sqlalchemy import text
@@ -22,8 +21,8 @@ from sqlalchemy.orm import Session
 from src.cache.redis_cache import cache_batch_predictions, get_redis_client
 from src.ml.promotion import get_production_model
 from src.ml.tracking import configure_mlflow
-from src.models.schema import CalibrationModel, FeaturesSnapshot, Prediction
-from src.models.trainer import FEATURE_COLS, prepare_features
+from src.models.schema import CalibrationModel, Prediction
+from src.models.trainer import prepare_features
 
 logger = logging.getLogger(__name__)
 
@@ -112,10 +111,25 @@ def load_latest_snapshots(db: Session, target_date: date | None = None) -> pd.Da
     return df
 
 
-def compute_shap_factors(model, X_row: pd.DataFrame) -> list[dict]:
+def resolve_next_trading_day(db: Session, feature_date: date) -> date:
+    """Get next trading day after feature_date from market_calendar or heuristic."""
+    result = db.execute(text("""
+        SELECT MIN(session_date) FROM market_calendar
+        WHERE session_date > :fd AND is_holiday = false
+    """), {"fd": feature_date})
+    row = result.fetchone()
+    if row and row[0]:
+        return row[0]
+
+    next_day = feature_date + timedelta(days=1)
+    while next_day.weekday() >= 5:
+        next_day += timedelta(days=1)
+    return next_day
+
+
+def compute_shap_factors(explainer: shap.TreeExplainer, X_row: pd.DataFrame) -> list[dict]:
     """Compute top SHAP feature contributions for a single prediction."""
     try:
-        explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X_row)
 
         if isinstance(shap_values, list):
@@ -151,10 +165,11 @@ def run_batch_predictions(
         logger.warning("No feature snapshots found for batch prediction")
         return {"predictions": 0, "errors": 0}
 
-    actual_date = snapshots_df["target_session_date"].iloc[0]
+    feature_date = snapshots_df["target_session_date"].iloc[0].date()
+    prediction_target = resolve_next_trading_day(db, feature_date)
     logger.info(
         f"Batch predict: {len(snapshots_df)} symbols, "
-        f"date={actual_date.date()}, model={reg.model_version}"
+        f"features_as_of={feature_date}, target={prediction_target}, model={reg.model_version}"
     )
 
     snapshots_df["direction"] = 0
@@ -171,6 +186,13 @@ def run_batch_predictions(
     else:
         cal_probs = raw_probs
 
+    explainer = None
+    if compute_explanations:
+        try:
+            explainer = shap.TreeExplainer(model)
+        except Exception:
+            logger.warning("Failed to create SHAP explainer, skipping explanations")
+
     now = datetime.now(UTC)
     predictions = []
     errors = 0
@@ -182,16 +204,16 @@ def run_batch_predictions(
             direction = "up" if prob_up >= 0.5 else "down"
 
             factors = []
-            if compute_explanations:
-                factors = compute_shap_factors(model, X.iloc[[i]])
+            if explainer is not None:
+                factors = compute_shap_factors(explainer, X.iloc[[i]])
 
             pred_dict = {
                 "prediction_id": _prediction_id(
-                    row["symbol"], actual_date.date(), reg.model_version
+                    row["symbol"], prediction_target, reg.model_version
                 ),
                 "symbol": row["symbol"],
                 "as_of_time": now,
-                "target_date": actual_date.date(),
+                "target_date": prediction_target,
                 "direction": direction,
                 "probability_up": prob_up,
                 "confidence": confidence,
@@ -218,7 +240,8 @@ def run_batch_predictions(
         "cached": cached,
         "errors": errors,
         "model_version": reg.model_version,
-        "target_date": str(actual_date.date()),
+        "feature_date": str(feature_date),
+        "target_date": str(prediction_target),
     }
 
 

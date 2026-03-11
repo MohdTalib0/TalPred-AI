@@ -20,6 +20,8 @@ import logging
 import time
 from datetime import date, timedelta
 
+import pandas as pd
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -124,12 +126,21 @@ def main():
 
         # ── Step 5: Register ──
         training_window = train_result.get("training_window", (str(start_date), str(end_date)))
+
+        def _parse_date(s: str | None, fallback: date) -> date:
+            if not s:
+                return fallback
+            try:
+                return pd.Timestamp(s).date()
+            except Exception:
+                return fallback
+
         model_version = register_model(
             db,
             mlflow_run_id=train_result["run_id"],
             algorithm="xgboost",
-            training_window_start=date.fromisoformat(training_window[0]) if training_window[0] else start_date,
-            training_window_end=date.fromisoformat(training_window[1]) if training_window[1] else end_date,
+            training_window_start=_parse_date(training_window[0], start_date),
+            training_window_end=_parse_date(training_window[1], end_date),
             metrics=train_result["metrics"],
             dataset_version=args.dataset_version,
             status="candidate",

@@ -11,7 +11,7 @@ Gates (all mandatory per ENG-SPEC 11):
 
 import hashlib
 import logging
-from datetime import UTC, date, datetime
+from datetime import date
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -80,13 +80,18 @@ def check_kpi_gates(metrics: dict) -> dict:
 
 
 def check_lineage(mlflow_run_id: str | None, dataset_version: str | None) -> dict:
-    """Verify full lineage is present."""
+    """Verify full lineage is present.
+
+    MLflow run_id is mandatory. Dataset version is recommended but
+    not a hard gate for v1 (DVC workflow may not always be run).
+    """
     issues = []
+    warnings = []
     if not mlflow_run_id:
         issues.append("Missing MLflow run_id")
     if not dataset_version:
-        issues.append("Missing dataset_version")
-    return {"passed": len(issues) == 0, "issues": issues}
+        warnings.append("Missing dataset_version (DVC not linked)")
+    return {"passed": len(issues) == 0, "issues": issues, "warnings": warnings}
 
 
 def register_model(

@@ -34,14 +34,14 @@ services:
       redis:
         condition: service_healthy
 
-  scheduler:
-    build: .
-    command: python -m scripts.daily_pipeline
-    env_file:
-      - .env
-    restart: "no"
-    depends_on:
-      - api
+  # scheduler: (Sprint 4 - uncomment when daily_pipeline is implemented)
+  #   build: .
+  #   command: python -m scripts.daily_pipeline
+  #   env_file:
+  #     - .env
+  #   restart: "no"
+  #   depends_on:
+  #     - api
 
 volumes:
   redis-data:
