@@ -291,3 +291,127 @@ def latest_predictions(
 def cache_stats():
     r = get_redis()
     return get_cache_stats(r)
+
+
+# ── Simulation Endpoints (BE-402) ────────────────────────────────────
+
+
+class SimulationRequest(BaseModel):
+    start_date: date
+    end_date: date
+    starting_capital: float = 100_000.0
+    min_confidence_trade: float = 0.60
+    max_position: float = 0.05
+    transaction_cost_bps: float = 10.0
+    slippage_bps: float = 5.0
+    model_version: str | None = None
+
+
+class SimulationMetrics(BaseModel):
+    total_return_pct: float
+    annualized_return_pct: float
+    sharpe_ratio: float
+    max_drawdown_pct: float
+    win_rate: float
+    total_trades: int
+    total_trading_days: int
+    total_transaction_costs: float
+    final_equity: float
+    net_profit: float
+
+
+class SimulationResponse(BaseModel):
+    run_id: str
+    metrics: SimulationMetrics | None = None
+    equity_curve: list[dict] | None = None
+    n_trades: int = 0
+    n_trading_days: int = 0
+    error: str | None = None
+
+
+class SimulationSummary(BaseModel):
+    run_id: str
+    start_date: date
+    end_date: date
+    starting_capital: float
+    status: str
+    result_metrics: dict | None = None
+
+
+@app.post("/simulation/run", response_model=SimulationResponse)
+def run_simulation_endpoint(req: SimulationRequest, db: Session = Depends(get_db)):
+    """Run a paper-trading simulation over a date range."""
+    from src.simulation.engine import run_simulation
+
+    if req.end_date <= req.start_date:
+        raise HTTPException(status_code=400, detail="end_date must be after start_date")
+
+    result = run_simulation(
+        db,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        starting_capital=req.starting_capital,
+        min_confidence_trade=req.min_confidence_trade,
+        max_position=req.max_position,
+        transaction_cost_bps=req.transaction_cost_bps,
+        slippage_bps=req.slippage_bps,
+        model_version=req.model_version,
+    )
+
+    if "error" in result:
+        return SimulationResponse(run_id=result["run_id"], error=result["error"])
+
+    return SimulationResponse(
+        run_id=result["run_id"],
+        metrics=SimulationMetrics(**result["metrics"]),
+        equity_curve=result.get("equity_curve"),
+        n_trades=result.get("n_trades", 0),
+        n_trading_days=result.get("n_trading_days", 0),
+    )
+
+
+@app.get("/simulation/{run_id}", response_model=SimulationSummary)
+def get_simulation(run_id: str, db: Session = Depends(get_db)):
+    """Get simulation run details."""
+    from src.models.schema import SimulationRun
+
+    sim = db.query(SimulationRun).filter(SimulationRun.run_id == run_id).first()
+    if not sim:
+        raise HTTPException(status_code=404, detail=f"Simulation {run_id} not found")
+
+    return SimulationSummary(
+        run_id=sim.run_id,
+        start_date=sim.start_date,
+        end_date=sim.end_date,
+        starting_capital=sim.starting_capital,
+        status=sim.status,
+        result_metrics=sim.result_metrics,
+    )
+
+
+# ── Monitoring Endpoints (OP-401) ────────────────────────────────────
+
+
+@app.get("/monitoring/status")
+def monitoring_status(db: Session = Depends(get_db)):
+    """Run all monitoring checks and return health report."""
+    from src.monitoring.checks import run_all_checks
+    return run_all_checks(db)
+
+
+@app.get("/monitoring/data-quality")
+def data_quality_check(db: Session = Depends(get_db)):
+    from src.monitoring.checks import check_data_quality
+    return check_data_quality(db)
+
+
+@app.get("/monitoring/freshness")
+def freshness_check(db: Session = Depends(get_db)):
+    from src.monitoring.checks import check_data_freshness
+    return check_data_freshness(db)
+
+
+@app.get("/monitoring/drift")
+def drift_check(db: Session = Depends(get_db)):
+    from src.monitoring.checks import check_feature_drift
+    return check_feature_drift(db)
