@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     newsapi_key: str = ""
     fred_api_key: str = ""
     finnhub_api_key: str = ""
+    openrouter_api_key: str = ""
 
     mlflow_tracking_uri: str = ""
     mlflow_tracking_username: str = ""
