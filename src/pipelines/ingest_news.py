@@ -35,9 +35,11 @@ def ingest_news(
     """Ingest news for symbol list. Returns counts."""
     articles = fetch_news_for_symbols(symbols, from_date, to_date)
 
+    symbol_set = set(symbols)
     inserted = 0
     skipped = 0
     quarantined = 0
+    mappings_created = 0
 
     for article in articles:
         is_valid, reason = validate_news_event(article)
@@ -78,6 +80,27 @@ def ingest_news(
         db.add(event)
         inserted += 1
 
+        matched_symbols = article.get("_matched_symbols", [])
+        for sym in matched_symbols:
+            if sym in symbol_set:
+                existing_map = db.query(NewsSymbolMapping).filter(
+                    NewsSymbolMapping.event_id == article["event_id"],
+                    NewsSymbolMapping.symbol == sym,
+                ).first()
+                if not existing_map:
+                    db.add(NewsSymbolMapping(
+                        event_id=article["event_id"],
+                        symbol=sym,
+                        relevance_score=1.0,
+                    ))
+                    mappings_created += 1
+
     db.commit()
-    logger.info(f"News: inserted={inserted}, skipped={skipped}, quarantined={quarantined}")
-    return {"inserted": inserted, "skipped": skipped, "quarantined": quarantined}
+    logger.info(
+        f"News: inserted={inserted}, skipped={skipped}, "
+        f"quarantined={quarantined}, mappings={mappings_created}"
+    )
+    return {
+        "inserted": inserted, "skipped": skipped,
+        "quarantined": quarantined, "mappings": mappings_created,
+    }

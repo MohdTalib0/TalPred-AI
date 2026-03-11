@@ -110,7 +110,9 @@ def train_baseline(
     try:
         mlflow.set_experiment(experiment_name)
     except Exception:
-        logger.warning("MLflow experiment setup failed, logging locally")
+        logger.warning("Remote MLflow setup failed, falling back to local tracking")
+        mlflow.set_tracking_uri("mlruns")
+        mlflow.set_experiment(experiment_name)
 
     with mlflow.start_run(run_name=run_name) as run:
         set_standard_tags(

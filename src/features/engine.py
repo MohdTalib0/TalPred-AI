@@ -24,6 +24,16 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 
+def _lookup_sentiment(sentiment_df: pd.DataFrame, symbol: str, td: date, col: str) -> float | None:
+    """Look up sentiment value for a symbol on a specific date."""
+    if sentiment_df.empty:
+        return None
+    match = sentiment_df[(sentiment_df["symbol"] == symbol) & (sentiment_df["date"] == td)]
+    if match.empty:
+        return None
+    return _to_float(match.iloc[0][col])
+
+
 def _to_float(val) -> float | None:
     """Convert numpy/pandas numeric types to native Python float."""
     if val is None or (isinstance(val, float) and np.isnan(val)):
@@ -38,6 +48,47 @@ def _to_float(val) -> float | None:
 logger = logging.getLogger(__name__)
 
 MAX_LOOKBACK_DAYS = 310  # ~200 trading days + buffer for weekends/holidays
+
+
+def load_sentiment_data(db: Session) -> pd.DataFrame:
+    """Load pre-computed sentiment scores from news_events aggregated by symbol and date.
+
+    Returns DataFrame with columns: symbol, date, sentiment_24h, sentiment_7d
+    """
+    result = db.execute(text("""
+        SELECT
+            nsm.symbol,
+            ne.published_time::date AS pub_date,
+            AVG(ne.sentiment_score) AS avg_sentiment
+        FROM news_events ne
+        JOIN news_symbol_mapping nsm ON ne.event_id = nsm.event_id
+        WHERE ne.sentiment_score IS NOT NULL
+        GROUP BY nsm.symbol, ne.published_time::date
+        ORDER BY nsm.symbol, pub_date
+    """))
+    rows = result.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "date", "sentiment_24h", "sentiment_7d"])
+
+    df = pd.DataFrame(rows, columns=["symbol", "date", "avg_sentiment"])
+
+    records = []
+    for symbol, grp in df.groupby("symbol"):
+        grp = grp.sort_values("date")
+        for _, row in grp.iterrows():
+            d = row["date"]
+            sent_24h = row["avg_sentiment"]
+            week_ago = d - pd.Timedelta(days=7)
+            sent_7d_rows = grp[(grp["date"] >= week_ago) & (grp["date"] <= d)]
+            sent_7d = sent_7d_rows["avg_sentiment"].mean() if len(sent_7d_rows) > 0 else sent_24h
+            records.append({
+                "symbol": symbol,
+                "date": d,
+                "sentiment_24h": float(sent_24h),
+                "sentiment_7d": float(sent_7d),
+            })
+
+    return pd.DataFrame(records) if records else pd.DataFrame(columns=["symbol", "date", "sentiment_24h", "sentiment_7d"])
 
 
 def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -182,14 +233,17 @@ def generate_features(
     symbols: list[str],
     target_dates: list[date] | None = None,
     dataset_version: str | None = None,
+    lookback_days: int | None = None,
 ) -> list[dict]:
     """Generate feature snapshots for given symbols.
 
     If target_dates is None, computes for the latest available date only (incremental mode).
     If target_dates is provided, computes for all those dates (backfill mode).
     """
-    logger.info(f"Loading market window for {len(symbols)} symbols...")
-    market_df = load_market_window(db, symbols)
+    lb = lookback_days or MAX_LOOKBACK_DAYS
+    logger.info(f"Loading market window for {len(symbols)} symbols (lookback={lb})...")
+    market_df = load_market_window(db, symbols, lookback_days=lb)
+    sentiment_df = load_sentiment_data(db)
     if market_df.empty:
         logger.warning("No market data found")
         return []
@@ -268,8 +322,8 @@ def generate_features(
                 "sector_return_1d": sector_1d,
                 "sector_return_5d": sector_5d,
                 "benchmark_relative_return_1d": benchmark_rel,
-                "news_sentiment_24h": None,
-                "news_sentiment_7d": None,
+                "news_sentiment_24h": _lookup_sentiment(sentiment_df, symbol, td, "sentiment_24h"),
+                "news_sentiment_7d": _lookup_sentiment(sentiment_df, symbol, td, "sentiment_7d"),
                 "vix_level": _to_float(macro.get("vix")),
                 "sp500_momentum_200d": _to_float(sp500_momentum_200d),
                 "regime_label": regime,

@@ -22,7 +22,10 @@ def configure_mlflow():
     if settings.mlflow_tracking_uri:
         mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
         os.environ["MLFLOW_TRACKING_USERNAME"] = settings.mlflow_tracking_username
-        os.environ["MLFLOW_TRACKING_PASSWORD"] = settings.mlflow_tracking_password
+        if settings.mlflow_tracking_token:
+            os.environ["MLFLOW_TRACKING_PASSWORD"] = settings.mlflow_tracking_token
+        else:
+            os.environ["MLFLOW_TRACKING_PASSWORD"] = settings.mlflow_tracking_password
         logger.info(f"MLflow configured: {settings.mlflow_tracking_uri}")
     else:
         logger.warning("No MLflow tracking URI set, using local tracking")
@@ -80,7 +83,9 @@ def log_training_run(
     try:
         mlflow.set_experiment(experiment_name)
     except Exception:
-        logger.warning("MLflow experiment setup failed, using default")
+        logger.warning("Remote MLflow setup failed, falling back to local tracking")
+        mlflow.set_tracking_uri("mlruns")
+        mlflow.set_experiment(experiment_name)
 
     with mlflow.start_run(run_name=run_name) as run:
         set_standard_tags(

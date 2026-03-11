@@ -9,10 +9,12 @@ class Settings(BaseSettings):
     fred_api_key: str = ""
     finnhub_api_key: str = ""
     openrouter_api_key: str = ""
+    openrouter_model_name: str = "meta-llama/llama-3.1-8b-instruct:free"
 
     mlflow_tracking_uri: str = ""
     mlflow_tracking_username: str = ""
     mlflow_tracking_password: str = ""
+    mlflow_tracking_token: str = ""
 
     prefect_api_key: str = ""
     prefect_api_url: str = ""
