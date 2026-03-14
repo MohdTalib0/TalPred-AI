@@ -53,6 +53,41 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Validate DATABASE_URL format (Supabase pooler)
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          from urllib.parse import urlparse
+
+          url = os.environ.get("DATABASE_URL", "")
+          if not url:
+              print("ERROR: DATABASE_URL secret is empty.")
+              sys.exit(1)
+
+          p = urlparse(url)
+          host = p.hostname or ""
+          user = p.username or ""
+          port = p.port
+          db = (p.path or "").lstrip("/")
+
+          print(f"DB host={host}, port={port}, db={db}, user_prefix={(user.split('.')[0] if user else '')}")
+
+          if "pooler.supabase.com" in host:
+              if "." not in user:
+                  print("ERROR: Supabase pooler URL must use user 'postgres.<project-ref>', not plain 'postgres'.")
+                  print("Fix DATABASE_URL secret using Supabase -> Database -> Connection pooling -> URI.")
+                  sys.exit(1)
+          elif host.startswith("db.") and host.endswith(".supabase.co"):
+              print("ERROR: Direct Supabase host is IPv6-only for this project. Use pooler host on port 6543.")
+              sys.exit(1)
+
+          if port != 6543:
+              print("WARNING: Expected pooler port 6543.")
+          if not db:
+              print("WARNING: Database name missing in URL path.")
+          PY
+
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
