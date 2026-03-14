@@ -30,8 +30,18 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Disable IPv6 (Supabase resolves to IPv6 which GH runners cannot reach)
-        run: sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+      - name: Force IPv4 DNS resolution (GH Actions runners lack IPv6 connectivity)
+        run: |
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=1
+          echo "precedence ::ffff:0:0/96 100" | sudo tee -a /etc/gai.conf
+          # Pin Supabase hostname to its IPv4 address
+          IPV4=$(dig +short A db.lyokdqqwlunyicwbrqny.supabase.co | head -1)
+          if [ -n "$IPV4" ]; then
+            echo "$IPV4 db.lyokdqqwlunyicwbrqny.supabase.co" | sudo tee -a /etc/hosts
+            echo "Pinned db.lyokdqqwlunyicwbrqny.supabase.co -> $IPV4"
+          fi
 
       - name: Checkout repository
         uses: actions/checkout@v4
