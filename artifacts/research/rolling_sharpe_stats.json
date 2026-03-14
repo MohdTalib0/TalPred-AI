@@ -1,0 +1,28 @@
+{
+  "window_days": 63,
+  "full_period": {
+    "mean_net": 2.4073805508914465,
+    "min_net": -8.422395895624613,
+    "max_net": 8.380400198964576,
+    "pct_positive": 71.55361050328227
+  },
+  "drought_net": {
+    "max_consecutive_negative_days": 60,
+    "avg_drought_length": 11.11111111111111,
+    "n_droughts": 9,
+    "avg_recovery_days": 11.11111111111111,
+    "max_recovery_days": 60
+  },
+  "drought_gross": {
+    "max_consecutive_negative_days": 59,
+    "avg_drought_length": 32.5,
+    "n_droughts": 2,
+    "avg_recovery_days": 32.5,
+    "max_recovery_days": 59
+  },
+  "yearly_median_net": {
+    "2024": -0.81357488984378,
+    "2025": 4.751506796299261,
+    "2026": 4.184814647262691
+  }
+}

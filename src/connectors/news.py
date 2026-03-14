@@ -74,6 +74,8 @@ def _normalize_finnhub_article(article: dict, symbol: str | None = None) -> dict
     published_str = datetime.fromtimestamp(published_ts, tz=UTC).isoformat() if published_ts else ""
     event_id = hashlib.sha256(f"{headline}:{published_str}".encode()).hexdigest()[:64]
 
+    from src.connectors.credibility import get_credibility
+
     result = {
         "event_id": event_id,
         "headline": headline,
@@ -82,7 +84,7 @@ def _normalize_finnhub_article(article: dict, symbol: str | None = None) -> dict
         "ingested_time": datetime.now(UTC).isoformat(),
         "sentiment_score": None,
         "event_tags": {"url": url, "category": article.get("category", "")},
-        "credibility_score": None,
+        "credibility_score": get_credibility(source),
     }
     if symbol:
         result["_matched_symbols"] = [symbol]

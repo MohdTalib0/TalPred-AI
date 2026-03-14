@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.frozen import FrozenEstimator
 from sklearn.metrics import brier_score_loss
 
 from src.models.trainer import prepare_features
@@ -23,6 +24,7 @@ def calibrate_model(
     df_calibration: pd.DataFrame,
     method: str = "isotonic",
     train_medians: pd.Series | None = None,
+    feature_profile: str = "all_features",
 ) -> dict:
     """Calibrate a trained model using held-out calibration data.
 
@@ -41,8 +43,8 @@ def calibrate_model(
     df_fit = df_calibration.iloc[:split_idx]
     df_eval = df_calibration.iloc[split_idx:]
 
-    X_fit, y_fit, medians = prepare_features(df_fit, fill_medians=train_medians)
-    X_eval, y_eval, _ = prepare_features(df_eval, fill_medians=medians)
+    X_fit, y_fit, medians = prepare_features(df_fit, fill_medians=train_medians, feature_profile=feature_profile)
+    X_eval, y_eval, _ = prepare_features(df_eval, fill_medians=medians, feature_profile=feature_profile)
 
     common_cols = [c for c in X_fit.columns if c in X_eval.columns]
     X_fit, X_eval = X_fit[common_cols], X_eval[common_cols]
@@ -50,7 +52,7 @@ def calibrate_model(
     raw_probs = model.predict_proba(X_eval)[:, 1]
     raw_brier = brier_score_loss(y_eval, raw_probs)
 
-    calibrated = CalibratedClassifierCV(model, method=method, cv="prefit")
+    calibrated = CalibratedClassifierCV(FrozenEstimator(model), method=method)
     calibrated.fit(X_fit, y_fit)
 
     cal_probs = calibrated.predict_proba(X_eval)[:, 1]

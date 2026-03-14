@@ -32,6 +32,7 @@ def run_all_checks(db: Session) -> dict:
         "data_quality": check_data_quality(db),
         "data_freshness": check_data_freshness(db),
         "model_performance": check_model_performance(db),
+        "signal_environment": check_signal_environment(db),
         "feature_drift": check_feature_drift(db),
         "pipeline_health": check_pipeline_health(db),
     }
@@ -194,6 +195,91 @@ def check_model_performance(db: Session) -> dict:
     return {
         "predictions_with_outcome_30d": total,
         "accuracy_30d": round(accuracy, 4) if accuracy is not None else None,
+        "alerts": alerts,
+    }
+
+
+def check_signal_environment(db: Session) -> dict:
+    """Monitor rolling live IC and cross-sectional dispersion."""
+    alerts = []
+
+    # Daily cross-sectional IC from realized prediction returns.
+    result = db.execute(text("""
+        SELECT target_date, probability_up, realized_return
+        FROM predictions
+        WHERE realized_return IS NOT NULL
+          AND target_date >= CURRENT_DATE - 120
+        ORDER BY target_date
+    """))
+    rows = result.fetchall()
+    ic_rolling_60d = None
+    n_ic_days = 0
+    if rows:
+        import pandas as pd
+
+        pred_df = pd.DataFrame(rows, columns=["target_date", "probability_up", "realized_return"])
+        daily_ic = []
+        for dt, grp in pred_df.groupby("target_date"):
+            if len(grp) < 10:
+                continue
+            ic = grp["probability_up"].corr(grp["realized_return"], method="spearman")
+            if pd.notna(ic):
+                daily_ic.append({"date": dt, "ic": float(ic)})
+        if daily_ic:
+            ic_df = pd.DataFrame(daily_ic).sort_values("date")
+            n_ic_days = len(ic_df)
+            if len(ic_df) >= 60:
+                ic_rolling_60d = float(ic_df["ic"].tail(60).mean())
+            else:
+                ic_rolling_60d = float(ic_df["ic"].mean())
+
+    if ic_rolling_60d is not None and ic_rolling_60d < 0.01:
+        alerts.append({
+            "level": "warning",
+            "check": "low_live_rolling_ic",
+            "detail": f"rolling live IC {ic_rolling_60d:.4f} < 0.0100",
+        })
+
+    # Cross-sectional dispersion of daily returns (last 60 sessions).
+    result = db.execute(text("""
+        WITH rets AS (
+            SELECT
+                date,
+                symbol,
+                close / NULLIF(LAG(close) OVER (PARTITION BY symbol ORDER BY date), 0) - 1 AS ret
+            FROM market_bars_daily
+            WHERE date >= CURRENT_DATE - 120
+        )
+        SELECT date, STDDEV(ret) AS dispersion
+        FROM rets
+        WHERE ret IS NOT NULL
+        GROUP BY date
+        ORDER BY date
+    """))
+    disp_rows = result.fetchall()
+    dispersion_60d_mean = None
+    if disp_rows:
+        import pandas as pd
+
+        disp_df = pd.DataFrame(disp_rows, columns=["date", "dispersion"])
+        if not disp_df.empty:
+            tail = disp_df.tail(60)
+            dispersion_60d_mean = float(tail["dispersion"].mean())
+
+    # Latest VIX proxy from features.
+    result = db.execute(text("""
+        SELECT AVG(vix_level)
+        FROM features_snapshot
+        WHERE target_session_date = (SELECT MAX(target_session_date) FROM features_snapshot)
+    """))
+    latest_vix = result.scalar()
+    latest_vix = float(latest_vix) if latest_vix is not None else None
+
+    return {
+        "rolling_live_ic_60d": round(ic_rolling_60d, 5) if ic_rolling_60d is not None else None,
+        "live_ic_days": n_ic_days,
+        "dispersion_60d_mean": round(dispersion_60d_mean, 6) if dispersion_60d_mean is not None else None,
+        "latest_vix_proxy": round(latest_vix, 3) if latest_vix is not None else None,
         "alerts": alerts,
     }
 

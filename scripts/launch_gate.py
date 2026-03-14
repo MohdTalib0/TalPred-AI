@@ -16,6 +16,7 @@ Usage:
 import logging
 import sys
 
+import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -142,6 +143,99 @@ def check_disclaimer(db) -> dict:
     }
 
 
+def check_live_ic_deployment_guard(
+    db,
+    rolling_window_days: int = 60,
+    lookback_days: int = 180,
+    reduce_threshold: float = 0.02,
+    suspend_threshold: float = 0.01,
+    consecutive_days: int = 10,
+) -> dict:
+    """Two-level live IC deployment guard.
+
+    - rolling_live_ic < suspend_threshold for N consecutive days => NO-GO
+    - rolling_live_ic < reduce_threshold for N consecutive days => GO with reduce-exposure action
+    """
+    result = db.execute(text("""
+        SELECT target_date, probability_up, realized_return
+        FROM predictions
+        WHERE realized_return IS NOT NULL
+          AND target_date >= CURRENT_DATE - :lookback_days
+        ORDER BY target_date
+    """), {"lookback_days": lookback_days})
+    rows = result.fetchall()
+    if not rows:
+        return {
+            "check": "live_ic_deployment_guard",
+            "passed": True,
+            "status": "insufficient_data",
+            "detail": "No realized prediction returns available yet",
+        }
+
+    df = pd.DataFrame(rows, columns=["target_date", "probability_up", "realized_return"])
+    daily = []
+    for dt, grp in df.groupby("target_date"):
+        if len(grp) < 10:
+            continue
+        ic = grp["probability_up"].corr(grp["realized_return"], method="spearman")
+        if pd.notna(ic):
+            daily.append({"date": pd.Timestamp(dt), "ic": float(ic)})
+
+    if len(daily) < rolling_window_days:
+        return {
+            "check": "live_ic_deployment_guard",
+            "passed": True,
+            "status": "insufficient_data",
+            "detail": f"Need >= {rolling_window_days} IC days, have {len(daily)}",
+        }
+
+    ic_df = pd.DataFrame(daily).sort_values("date")
+    ic_df["rolling_live_ic"] = ic_df["ic"].rolling(rolling_window_days).mean()
+    ric = ic_df.dropna(subset=["rolling_live_ic"]).copy()
+    if ric.empty:
+        return {
+            "check": "live_ic_deployment_guard",
+            "passed": True,
+            "status": "insufficient_data",
+            "detail": "Rolling live IC unavailable",
+        }
+
+    tail = ric.tail(consecutive_days)
+    latest = float(ric["rolling_live_ic"].iloc[-1])
+    below_suspend = bool((tail["rolling_live_ic"] < suspend_threshold).all()) if len(tail) == consecutive_days else False
+    below_reduce = bool((tail["rolling_live_ic"] < reduce_threshold).all()) if len(tail) == consecutive_days else False
+
+    if below_suspend:
+        return {
+            "check": "live_ic_deployment_guard",
+            "passed": False,
+            "status": "suspend",
+            "latest_rolling_live_ic": round(latest, 5),
+            "detail": (
+                f"rolling live IC < {suspend_threshold:.3f} for {consecutive_days} consecutive days; "
+                "suspend strategy"
+            ),
+        }
+    if below_reduce:
+        return {
+            "check": "live_ic_deployment_guard",
+            "passed": True,
+            "status": "reduce_exposure",
+            "latest_rolling_live_ic": round(latest, 5),
+            "detail": (
+                f"rolling live IC < {reduce_threshold:.3f} for {consecutive_days} consecutive days; "
+                "reduce exposure"
+            ),
+        }
+    return {
+        "check": "live_ic_deployment_guard",
+        "passed": True,
+        "status": "normal",
+        "latest_rolling_live_ic": round(latest, 5),
+        "detail": "Live IC regime healthy",
+    }
+
+
 def main():
     db = SessionLocal()
 
@@ -156,6 +250,7 @@ def main():
             check_production_model(db),
             check_rollback_capability(db),
             check_disclaimer(db),
+            check_live_ic_deployment_guard(db),
         ]
 
         monitoring = run_all_checks(db)
@@ -170,7 +265,10 @@ def main():
 
         for c in checks:
             status = "PASS" if c["passed"] else "FAIL"
-            logger.info(f"  [{status}] {c['check']}: {c.get('value', c.get('detail', ''))}")
+            extra = c.get("value", c.get("detail", ""))
+            if c.get("status") in {"reduce_exposure", "suspend"}:
+                extra = f"{extra} (status={c.get('status')})"
+            logger.info(f"  [{status}] {c['check']}: {extra}")
 
         logger.info("")
         logger.info("=" * 60)

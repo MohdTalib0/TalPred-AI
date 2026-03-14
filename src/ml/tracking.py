@@ -48,11 +48,14 @@ def set_standard_tags(
     training_window_start: str | None = None,
     training_window_end: str | None = None,
     model_type: str = "xgboost",
+    run_mode: str | None = None,
 ):
     """Set mandatory MLflow tags per ENG-SPEC 10.1."""
     mlflow.set_tag("git_commit", get_git_hash())
     mlflow.set_tag("pipeline_version", PIPELINE_VERSION)
     mlflow.set_tag("model_type", model_type)
+    if run_mode:
+        mlflow.set_tag("run_mode", run_mode)
 
     if dataset_version:
         mlflow.set_tag("dataset_version", dataset_version)

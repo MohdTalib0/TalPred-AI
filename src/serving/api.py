@@ -305,6 +305,14 @@ class SimulationRequest(BaseModel):
     transaction_cost_bps: float = 10.0
     slippage_bps: float = 5.0
     model_version: str | None = None
+    enable_regime_guard: bool = True
+    vix_quarter_exposure_below: float = 12.0
+    vix_half_exposure_below: float = 15.0
+    vix_full_exposure_above: float = 20.0
+    use_live_ic_guard: bool = False
+    live_ic_lookback_days: int = 60
+    live_ic_floor: float = 0.01
+    low_ic_exposure_scale: float = 0.5
 
 
 class SimulationMetrics(BaseModel):
@@ -356,6 +364,14 @@ def run_simulation_endpoint(req: SimulationRequest, db: Session = Depends(get_db
         transaction_cost_bps=req.transaction_cost_bps,
         slippage_bps=req.slippage_bps,
         model_version=req.model_version,
+        enable_regime_guard=req.enable_regime_guard,
+        vix_quarter_exposure_below=req.vix_quarter_exposure_below,
+        vix_half_exposure_below=req.vix_half_exposure_below,
+        vix_full_exposure_above=req.vix_full_exposure_above,
+        use_live_ic_guard=req.use_live_ic_guard,
+        live_ic_lookback_days=req.live_ic_lookback_days,
+        live_ic_floor=req.live_ic_floor,
+        low_ic_exposure_scale=req.low_ic_exposure_scale,
     )
 
     if "error" in result:

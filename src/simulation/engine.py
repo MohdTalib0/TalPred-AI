@@ -34,6 +34,14 @@ def run_simulation(
     slippage_bps: float = 5.0,
     top_n: int = 20,
     model_version: str | None = None,
+    enable_regime_guard: bool = True,
+    vix_quarter_exposure_below: float = 12.0,
+    vix_half_exposure_below: float = 15.0,
+    vix_full_exposure_above: float = 20.0,
+    use_live_ic_guard: bool = False,
+    live_ic_lookback_days: int = 60,
+    live_ic_floor: float = 0.01,
+    low_ic_exposure_scale: float = 0.5,
 ) -> dict:
     """Execute a full paper-trading simulation over a date range.
 
@@ -77,6 +85,8 @@ def run_simulation(
     equity_curve = [{"date": str(start_date), "equity": equity}]
     all_trades = []
     daily_returns = []
+    daily_exposure_scales = []
+    live_ic_trace = []
 
     cost_factor = (transaction_cost_bps + slippage_bps) / 10_000
 
@@ -91,7 +101,24 @@ def run_simulation(
 
         day_preds = day_preds.nlargest(top_n, "confidence")
 
-        weights = _compute_weights(day_preds, max_position)
+        exposure_scale, live_ic = _compute_exposure_scale(
+            db=db,
+            day_preds=day_preds,
+            as_of_date=td,
+            model_version=model_version,
+            enable_regime_guard=enable_regime_guard,
+            vix_quarter_exposure_below=vix_quarter_exposure_below,
+            vix_half_exposure_below=vix_half_exposure_below,
+            vix_full_exposure_above=vix_full_exposure_above,
+            use_live_ic_guard=use_live_ic_guard,
+            live_ic_lookback_days=live_ic_lookback_days,
+            live_ic_floor=live_ic_floor,
+            low_ic_exposure_scale=low_ic_exposure_scale,
+        )
+        weights = _compute_weights(day_preds, max_position, exposure_scale=exposure_scale)
+        daily_exposure_scales.append(float(exposure_scale))
+        if live_ic is not None:
+            live_ic_trace.append(float(live_ic))
 
         day_pnl = 0.0
         day_trades = []
@@ -147,6 +174,10 @@ def run_simulation(
     metrics = _compute_metrics(
         equity_curve, daily_returns, all_trades, starting_capital
     )
+    metrics["avg_exposure_scale"] = round(float(np.mean(daily_exposure_scales)), 4) if daily_exposure_scales else 1.0
+    metrics["min_exposure_scale"] = round(float(np.min(daily_exposure_scales)), 4) if daily_exposure_scales else 1.0
+    metrics["use_live_ic_guard"] = bool(use_live_ic_guard)
+    metrics["live_ic_avg"] = round(float(np.mean(live_ic_trace)), 5) if live_ic_trace else None
 
     _save_trades(db, all_trades)
 
@@ -179,8 +210,10 @@ def _load_predictions(
         params["mv"] = model_version
 
     result = db.execute(text(f"""
-        SELECT symbol, target_date, direction, probability_up, confidence, model_version
+        SELECT p.symbol, p.target_date, p.direction, p.probability_up, p.confidence, p.model_version,
+               fs.vix_level, p.realized_return
         FROM predictions p
+        LEFT JOIN features_snapshot fs ON p.feature_snapshot_id = fs.snapshot_id
         WHERE target_date >= :start AND target_date <= :end
         {mv_filter}
         ORDER BY target_date, confidence DESC
@@ -191,7 +224,7 @@ def _load_predictions(
         return pd.DataFrame()
 
     df = pd.DataFrame(rows, columns=[
-        "symbol", "target_date", "direction", "probability_up", "confidence", "model_version"
+        "symbol", "target_date", "direction", "probability_up", "confidence", "model_version", "vix_level", "realized_return"
     ])
     return df
 
@@ -211,7 +244,7 @@ def _load_prices(db: Session, start_date: date, end_date: date) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["symbol", "date", "open", "close"])
 
 
-def _compute_weights(preds_df: pd.DataFrame, max_position: float) -> dict[str, float]:
+def _compute_weights(preds_df: pd.DataFrame, max_position: float, exposure_scale: float = 1.0) -> dict[str, float]:
     """Confidence-weighted allocation with position cap."""
     total_confidence = preds_df["confidence"].sum()
     if total_confidence == 0:
@@ -227,7 +260,95 @@ def _compute_weights(preds_df: pd.DataFrame, max_position: float) -> dict[str, f
         scale = 1.0 / weight_sum
         weights = {k: v * scale for k, v in weights.items()}
 
+    exposure_scale = float(min(max(exposure_scale, 0.0), 1.0))
+    if exposure_scale < 1.0:
+        weights = {k: v * exposure_scale for k, v in weights.items()}
+
     return weights
+
+
+def _compute_exposure_scale(
+    db: Session,
+    day_preds: pd.DataFrame,
+    as_of_date: date,
+    model_version: str | None,
+    enable_regime_guard: bool,
+    vix_quarter_exposure_below: float,
+    vix_half_exposure_below: float,
+    vix_full_exposure_above: float,
+    use_live_ic_guard: bool,
+    live_ic_lookback_days: int,
+    live_ic_floor: float,
+    low_ic_exposure_scale: float,
+) -> tuple[float, float | None]:
+    """Combine VIX-based and live-IC-based exposure controls."""
+    if not enable_regime_guard:
+        return 1.0, None
+
+    vix_scale = 1.0
+    vix = None
+    if "vix_level" in day_preds.columns and day_preds["vix_level"].notna().any():
+        vix = float(day_preds["vix_level"].median())
+        if vix < vix_quarter_exposure_below:
+            vix_scale = 0.25
+        elif vix < vix_half_exposure_below:
+            vix_scale = 0.50
+        elif vix >= vix_full_exposure_above:
+            vix_scale = 1.0
+        else:
+            vix_scale = 0.75
+
+    live_ic = None
+    ic_scale = 1.0
+    if use_live_ic_guard:
+        live_ic = _compute_live_rolling_ic(db, as_of_date, live_ic_lookback_days, model_version=model_version)
+        if live_ic is not None and live_ic < live_ic_floor:
+            ic_scale = float(min(max(low_ic_exposure_scale, 0.0), 1.0))
+
+    return min(vix_scale, ic_scale), live_ic
+
+
+def _compute_live_rolling_ic(
+    db: Session,
+    as_of_date: date,
+    lookback_days: int,
+    model_version: str | None = None,
+) -> float | None:
+    """Compute trailing mean daily IC from realized predictions before as_of_date."""
+    mv_filter = "AND model_version = :mv" if model_version else ""
+    params = {
+        "start": as_of_date - pd.Timedelta(days=lookback_days),
+        "end": as_of_date,
+    }
+    if model_version:
+        params["mv"] = model_version
+
+    result = db.execute(text(f"""
+        SELECT target_date, probability_up, realized_return
+        FROM predictions
+        WHERE target_date >= :start
+          AND target_date < :end
+          AND realized_return IS NOT NULL
+          {mv_filter}
+        ORDER BY target_date
+    """), params)
+    rows = result.fetchall()
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows, columns=["target_date", "probability_up", "realized_return"])
+    if df.empty:
+        return None
+    daily_ics = []
+    for _, day_df in df.groupby("target_date"):
+        if len(day_df) < 10:
+            continue
+        ic = day_df["probability_up"].corr(day_df["realized_return"], method="spearman")
+        if pd.notna(ic):
+            daily_ics.append(float(ic))
+    if not daily_ics:
+        return None
+    return float(np.mean(daily_ics))
 
 
 def _compute_metrics(

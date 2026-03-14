@@ -27,6 +27,12 @@ KPI_GATES = {
     "max_log_loss": 1.0,
 }
 
+BACKTEST_GATES = {
+    "min_auc": 0.52,
+    "min_rank_sharpe_net": 1.0,
+    "max_rank_mdd_net_abs": 0.40,
+}
+
 
 def generate_model_version(algorithm: str, run_id: str) -> str:
     """Generate a v{major}.{minor}.{patch} model version.
@@ -92,6 +98,72 @@ def check_lineage(mlflow_run_id: str | None, dataset_version: str | None) -> dic
     if not dataset_version:
         warnings.append("Missing dataset_version (DVC not linked)")
     return {"passed": len(issues) == 0, "issues": issues, "warnings": warnings}
+
+
+def check_backtest_gates(backtest_results: dict | None) -> dict:
+    """Validate ranking-first backtest promotion criteria."""
+    if not backtest_results:
+        return {"passed": True, "detail": "no backtest provided (skipped)", "gate_results": []}
+
+    agg = backtest_results.get("aggregate_metrics", {})
+    results = []
+    all_passed = True
+
+    bt_auc = agg.get("overall_auc")
+    if bt_auc is None:
+        results.append({"gate": "min_backtest_auc", "passed": False, "detail": "missing overall_auc"})
+        all_passed = False
+    elif bt_auc < BACKTEST_GATES["min_auc"]:
+        results.append({
+            "gate": "min_backtest_auc",
+            "passed": False,
+            "detail": f"backtest AUC {bt_auc:.4f} < {BACKTEST_GATES['min_auc']}",
+        })
+        all_passed = False
+    else:
+        results.append({"gate": "min_backtest_auc", "passed": True, "detail": f"backtest AUC {bt_auc:.4f}"})
+
+    sharpe_net = agg.get("rank_long_short_sharpe_net_nw")
+    sharpe_label = "net NW ranking Sharpe"
+    if sharpe_net is None:
+        sharpe_net = agg.get("rank_long_short_sharpe_net")
+        sharpe_label = "net ranking Sharpe"
+    if sharpe_net is None:
+        results.append({"gate": "min_rank_sharpe_net", "passed": False, "detail": "missing net ranking Sharpe metric"})
+        all_passed = False
+    elif sharpe_net < BACKTEST_GATES["min_rank_sharpe_net"]:
+        results.append({
+            "gate": "min_rank_sharpe_net",
+            "passed": False,
+            "detail": f"{sharpe_label} {sharpe_net:.3f} < {BACKTEST_GATES['min_rank_sharpe_net']}",
+        })
+        all_passed = False
+    else:
+        results.append({
+            "gate": "min_rank_sharpe_net",
+            "passed": True,
+            "detail": f"{sharpe_label} {sharpe_net:.3f}",
+        })
+
+    mdd_net = agg.get("rank_max_drawdown_net")
+    if mdd_net is None:
+        results.append({"gate": "max_rank_mdd_net_abs", "passed": False, "detail": "missing rank_max_drawdown_net"})
+        all_passed = False
+    elif abs(float(mdd_net)) > BACKTEST_GATES["max_rank_mdd_net_abs"]:
+        results.append({
+            "gate": "max_rank_mdd_net_abs",
+            "passed": False,
+            "detail": f"net ranking drawdown {mdd_net:.3f} exceeds {BACKTEST_GATES['max_rank_mdd_net_abs']:.2f}",
+        })
+        all_passed = False
+    else:
+        results.append({
+            "gate": "max_rank_mdd_net_abs",
+            "passed": True,
+            "detail": f"net ranking drawdown {mdd_net:.3f}",
+        })
+
+    return {"passed": all_passed, "gate_results": results}
 
 
 def register_model(
@@ -185,19 +257,9 @@ def promote_model(
     lineage_check = check_lineage(mlflow_run_id, dataset_version)
     report["lineage_check"] = lineage_check
 
-    backtest_ok = True
-    if backtest_results:
-        bt_acc = backtest_results.get("aggregate_metrics", {}).get("overall_accuracy", 0)
-        if bt_acc < KPI_GATES["min_accuracy"]:
-            backtest_ok = False
-            report["backtest_check"] = {"passed": False, "detail": f"backtest accuracy {bt_acc:.4f} too low"}
-        elif bt_acc > KPI_GATES["max_accuracy"]:
-            backtest_ok = False
-            report["backtest_check"] = {"passed": False, "detail": f"backtest accuracy {bt_acc:.4f} too high (leakage)"}
-        else:
-            report["backtest_check"] = {"passed": True, "detail": f"backtest accuracy {bt_acc:.4f}"}
-    else:
-        report["backtest_check"] = {"passed": True, "detail": "no backtest provided (skipped)"}
+    backtest_check = check_backtest_gates(backtest_results)
+    report["backtest_check"] = backtest_check
+    backtest_ok = backtest_check["passed"]
 
     all_passed = kpi_check["passed"] and lineage_check["passed"] and backtest_ok
     report["promoted"] = all_passed

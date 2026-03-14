@@ -1,0 +1,40 @@
+{
+  "core": {
+    "passed": true,
+    "nw_sharpe": 1.7787878712927638,
+    "ic": 0.04133001596117739,
+    "auc": 0.5257128480267552,
+    "mdd": -0.33215162175827295
+  },
+  "time_stability": {
+    "passed": false,
+    "yearly": {
+      "2024": -1.126462735663702,
+      "2025": 4.281676507511013,
+      "2026": 6.48274545564671
+    },
+    "positive_years": 2,
+    "min_yearly_sharpe": -1.126462735663702
+  },
+  "sector_contribution": {
+    "passed": true,
+    "positive_sectors": 11,
+    "total_sectors": 11,
+    "concentration_ratio": 2.2246509272455466,
+    "sector_sharpes": {
+      "Industrials": 3.6880067214253596,
+      "Technology": 0.422865873862927,
+      "Communication Services": 2.2794528960062896,
+      "Basic Materials": 0.33825599505871695,
+      "Utilities": 0.9699470571087254,
+      "Real Estate": 1.9623052852710627,
+      "Consumer Cyclical": 2.495804493370462,
+      "Energy": 0.5567638439469661,
+      "Consumer Defensive": 4.477026950663296,
+      "Healthcare": 4.475274697645648,
+      "Financial Services": 0.4713855843229001
+    }
+  },
+  "residual_flow_delta": -1.6415024014762378,
+  "promote": false
+}

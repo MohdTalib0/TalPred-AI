@@ -7,11 +7,116 @@ timestamp. This prevents look-ahead bias -- the #1 risk in financial ML.
 import logging
 from datetime import date
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+
+def _winsorize_series(s: pd.Series, lower_q: float = 0.01, upper_q: float = 0.99) -> pd.Series:
+    """Winsorize a series to reduce outlier impact."""
+    if s.empty or s.dropna().empty:
+        return s
+    lo = s.quantile(lower_q)
+    hi = s.quantile(upper_q)
+    return s.clip(lower=lo, upper=hi)
+
+
+def _add_flow_residuals(
+    df: pd.DataFrame,
+    flow_cols: list[str],
+    size_col: str = "log_market_cap",
+) -> pd.DataFrame:
+    """Orthogonalize flow features against size and sector via per-date OLS.
+
+    For each trading date, regresses each flow feature on:
+      [intercept, log_market_cap, sector_dummies]
+    and keeps only the residual — the part of flow *not* explained by size or
+    sector rotation.  Produces columns named `{col}_resid`.
+
+    This isolates pure stock-specific order flow, which is often more predictive
+    than raw flow that is confounded by market-cap and sector effects.
+    """
+    if df.empty or size_col not in df.columns:
+        return df
+
+    available = [c for c in flow_cols if c in df.columns]
+    if not available:
+        return df
+
+    result_parts = []
+    for _, grp in df.groupby("target_session_date"):
+        grp = grp.copy()
+
+        # Build per-date design matrix: intercept + size + sector dummies.
+        X_parts: list[np.ndarray] = [np.ones(len(grp))]
+        size_vals = grp[size_col].fillna(grp[size_col].median()).values
+        X_parts.append(size_vals)
+        if "sector" in grp.columns:
+            sec_dummies = pd.get_dummies(grp["sector"], drop_first=True, dtype=float).values
+            if sec_dummies.shape[1] > 0:
+                X_parts.append(sec_dummies)
+        X = np.column_stack(X_parts)
+
+        for col in available:
+            y = grp[col].values.astype(float)
+            # Replace inf before OLS — inf in flow features causes lstsq to blow up.
+            y = np.where(np.isinf(y), np.nan, y)
+            mask = ~np.isnan(y) & ~np.isnan(X).any(axis=1) & ~np.isinf(X).any(axis=1)
+            resid = np.full(len(y), np.nan)
+            if mask.sum() > X.shape[1] + 2:
+                beta, _, _, _ = np.linalg.lstsq(X[mask], y[mask], rcond=None)
+                y_hat = X @ beta
+                resid[mask] = y[mask] - y_hat[mask]
+            grp[f"{col}_resid"] = resid
+
+        result_parts.append(grp)
+
+    return pd.concat(result_parts, ignore_index=True) if result_parts else df
+
+
+def _add_cross_sectional_transforms(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Add daily cross-sectional z-score and sector-neutral features.
+
+    For each feature x:
+      - x_cs: winsorized daily cross-sectional z-score
+      - x_sector_neutral: x_cs minus sector mean(x_cs) on same date
+    """
+    if df.empty:
+        return df
+
+    available = [c for c in cols if c in df.columns]
+    if not available:
+        return df
+
+    for col in available:
+        win_col = f"{col}_win"
+        cs_col = f"{col}_cs"
+        sn_col = f"{col}_sector_neutral"
+
+        # Winsorize cross-section by date.
+        df[win_col] = df.groupby("target_session_date")[col].transform(
+            lambda s: _winsorize_series(s, 0.01, 0.99)
+        )
+
+        # Cross-sectional z-score by date.
+        grp = df.groupby("target_session_date")[win_col]
+        mean = grp.transform("mean")
+        std = grp.transform("std").replace(0, np.nan)
+        df[cs_col] = ((df[win_col] - mean) / std).clip(-6.0, 6.0)
+
+        # Sector neutral residual of cross-sectional z-score.
+        if "sector" in df.columns:
+            sec_mean = df.groupby(["target_session_date", "sector"])[cs_col].transform("mean")
+            df[sn_col] = df[cs_col] - sec_mean
+        else:
+            df[sn_col] = np.nan
+
+        df = df.drop(columns=[win_col])
+
+    return df
 
 
 def as_of_join_market(
@@ -102,37 +207,80 @@ def build_training_dataset(
     symbols: list[str],
     start_date: date,
     end_date: date,
+    target_mode: str = "absolute",
+    top_bottom_pct: float = 0.30,
+    target_horizon_days: int = 1,
+    include_liquidity_features: bool = False,
 ) -> pd.DataFrame:
     """Build a leakage-safe training dataset from features_snapshot.
 
     Each feature row is joined with the NEXT session's actual return as the target.
     This ensures we predict tomorrow using only today's features.
     """
-    result = db.execute(text("""
+    if target_horizon_days < 1 or target_horizon_days > 20:
+        raise ValueError("target_horizon_days must be between 1 and 20")
+
+    result = db.execute(text(f"""
         SELECT
             fs.symbol,
             fs.target_session_date,
+            s.sector,
             fs.rsi_14,
             fs.momentum_5d,
             fs.momentum_10d,
+            fs.momentum_20d,
+            fs.momentum_60d,
+            fs.momentum_120d,
             fs.rolling_return_5d,
             fs.rolling_return_20d,
             fs.rolling_volatility_20d,
             fs.macd,
             fs.macd_signal,
+            fs.short_term_reversal,
             fs.sector_return_1d,
             fs.sector_return_5d,
+            fs.sector_relative_return_1d,
+            fs.sector_relative_return_5d,
+            fs.momentum_rank_market,
+            fs.momentum_60d_rank_market,
+            fs.momentum_120d_rank_market,
+            fs.short_term_reversal_rank_market,
+            fs.volatility_rank_market,
+            fs.rsi_rank_market,
+            fs.volume_rank_market,
+            fs.sector_momentum_rank,
+            fs.volume_change_5d,
+            fs.volume_zscore_20d,
+            fs.volatility_expansion_5_20,
+            fs.volume_acceleration,
+            fs.signed_volume_proxy,
+            fs.price_volume_trend,
+            fs.volume_imbalance_proxy,
+            fs.liquidity_shock_5d,
+            fs.vwap_deviation,
             fs.benchmark_relative_return_1d,
             fs.news_sentiment_24h,
             fs.news_sentiment_7d,
+            fs.news_sentiment_std,
+            fs.news_positive_ratio,
+            fs.news_negative_ratio,
+            fs.news_volume,
+            fs.news_credibility_avg,
+            fs.news_present_flag,
             fs.vix_level,
             fs.sp500_momentum_200d,
             fs.regime_label,
+            s.market_cap,
+            s.avg_daily_volume_30d,
+            mb.close,
+            mb.volume,
             -- Target: next day's return (label)
-            LEAD(mb.close, 1) OVER (PARTITION BY fs.symbol ORDER BY fs.target_session_date) / mb.close - 1 AS next_day_return
+            LEAD(mb.close, {target_horizon_days}) OVER (PARTITION BY fs.symbol ORDER BY fs.target_session_date) / mb.close - 1 AS next_day_return
         FROM features_snapshot fs
         JOIN market_bars_daily mb
             ON fs.symbol = mb.symbol AND fs.target_session_date = mb.date
+        JOIN symbols s
+            ON fs.symbol = s.symbol
         WHERE fs.target_session_date >= :start_date
           AND fs.target_session_date <= :end_date
           AND fs.symbol = ANY(:symbols)
@@ -144,29 +292,135 @@ def build_training_dataset(
         return pd.DataFrame()
 
     columns = [
-        "symbol", "target_session_date",
-        "rsi_14", "momentum_5d", "momentum_10d",
+        "symbol", "target_session_date", "sector",
+        "rsi_14", "momentum_5d", "momentum_10d", "momentum_20d", "momentum_60d", "momentum_120d",
         "rolling_return_5d", "rolling_return_20d", "rolling_volatility_20d",
-        "macd", "macd_signal",
+        "macd", "macd_signal", "short_term_reversal",
         "sector_return_1d", "sector_return_5d",
+        "sector_relative_return_1d", "sector_relative_return_5d",
+        "momentum_rank_market", "momentum_60d_rank_market", "momentum_120d_rank_market",
+        "short_term_reversal_rank_market", "volatility_rank_market", "rsi_rank_market",
+        "volume_rank_market", "sector_momentum_rank",
+        "volume_change_5d", "volume_zscore_20d", "volatility_expansion_5_20",
+        "volume_acceleration", "signed_volume_proxy", "price_volume_trend",
+        "volume_imbalance_proxy", "liquidity_shock_5d", "vwap_deviation",
         "benchmark_relative_return_1d",
         "news_sentiment_24h", "news_sentiment_7d",
+        "news_sentiment_std", "news_positive_ratio", "news_negative_ratio",
+        "news_volume", "news_credibility_avg", "news_present_flag",
         "vix_level", "sp500_momentum_200d",
         "regime_label",
+        "market_cap", "avg_daily_volume_30d", "close", "volume",
         "next_day_return",
     ]
 
     df = pd.DataFrame(rows, columns=columns)
     df["target_session_date"] = pd.to_datetime(df["target_session_date"])
 
-    df["direction"] = (df["next_day_return"] > 0).astype(int)
-
     df = df.dropna(subset=["next_day_return"])
+
+    if include_liquidity_features:
+        df["log_market_cap"] = df["market_cap"].apply(lambda x: None if pd.isna(x) else np.log1p(x))
+        df["market_cap_rank"] = df.groupby("target_session_date")["market_cap"].rank(pct=True)
+        df["dollar_volume"] = df["close"] * df["volume"]
+        df["turnover_ratio"] = df["volume"] / df["avg_daily_volume_30d"].replace(0, pd.NA)
+        df["dollar_volume_rank_market"] = df.groupby("target_session_date")["dollar_volume"].rank(pct=True)
+
+        # Turnover acceleration: deviation from 20-day rolling mean of turnover.
+        # Positive → sudden increase in trading activity vs recent baseline.
+        df_sorted = df.sort_values(["symbol", "target_session_date"])
+        rolling_turnover = df_sorted.groupby("symbol")["turnover_ratio"].transform(
+            lambda x: x.rolling(20, min_periods=5).mean()
+        )
+        df["turnover_acceleration"] = df_sorted["turnover_ratio"] - rolling_turnover
+
+    if target_mode == "absolute":
+        df["target_value"] = df["next_day_return"]
+        df["direction"] = (df["target_value"] > 0).astype(int)
+    elif target_mode == "market_relative":
+        market_map = (
+            df[df["symbol"] == "SPY"][["target_session_date", "next_day_return"]]
+            .drop_duplicates("target_session_date")
+            .set_index("target_session_date")["next_day_return"]
+        )
+        df["benchmark_return"] = df["target_session_date"].map(market_map)
+        df = df.dropna(subset=["benchmark_return"])
+        df["target_value"] = df["next_day_return"] - df["benchmark_return"]
+        df["direction"] = (df["target_value"] > 0).astype(int)
+    elif target_mode == "sector_relative":
+        sector_bench = (
+            df.groupby(["target_session_date", "sector"])["next_day_return"]
+            .mean()
+            .rename("sector_benchmark")
+            .reset_index()
+        )
+        df = df.merge(sector_bench, on=["target_session_date", "sector"], how="left")
+        df = df.dropna(subset=["sector_benchmark"])
+        df["target_value"] = df["next_day_return"] - df["sector_benchmark"]
+        df["direction"] = (df["target_value"] > 0).astype(int)
+    elif target_mode == "market_relative_top_bottom":
+        market_map = (
+            df[df["symbol"] == "SPY"][["target_session_date", "next_day_return"]]
+            .drop_duplicates("target_session_date")
+            .set_index("target_session_date")["next_day_return"]
+        )
+        df["benchmark_return"] = df["target_session_date"].map(market_map)
+        df = df.dropna(subset=["benchmark_return"])
+        df["target_value"] = df["next_day_return"] - df["benchmark_return"]
+
+        bounds = (
+            df.groupby("target_session_date")["target_value"]
+            .quantile([top_bottom_pct, 1 - top_bottom_pct])
+            .unstack()
+            .rename(columns={top_bottom_pct: "lower_bound", 1 - top_bottom_pct: "upper_bound"})
+            .reset_index()
+        )
+        df = df.merge(bounds, on="target_session_date", how="left")
+        df["direction"] = pd.NA
+        df.loc[df["target_value"] <= df["lower_bound"], "direction"] = 0
+        df.loc[df["target_value"] >= df["upper_bound"], "direction"] = 1
+        df = df.dropna(subset=["direction"])
+        df["direction"] = df["direction"].astype(int)
+    else:
+        raise ValueError(f"Unsupported target_mode: {target_mode}")
+
+    if not include_liquidity_features:
+        for col in [
+            "log_market_cap", "market_cap_rank", "dollar_volume", "turnover_ratio",
+            "dollar_volume_rank_market", "turnover_acceleration",
+            "volume_acceleration_resid", "signed_volume_proxy_resid", "turnover_acceleration_resid",
+            "volume_imbalance_proxy_resid", "liquidity_shock_5d_resid", "vwap_deviation_resid",
+        ]:
+            if col in df.columns:
+                df = df.drop(columns=[col])
+
+    # Cross-sectional transforms (same-day only, leakage-safe for ranking use).
+    transform_cols = [
+        "momentum_20d",
+        "momentum_60d",
+        "volume_change_5d",
+        "volume_zscore_20d",
+        "rolling_volatility_20d",
+        "turnover_ratio",
+    ]
+    df = _add_cross_sectional_transforms(df, transform_cols)
+
+    # Residual flow modeling: orthogonalize flow signals against size + sector.
+    # Captures pure stock-level order flow after removing market-cap/sector bias.
+    flow_resid_cols = [
+        "volume_acceleration", "signed_volume_proxy", "turnover_acceleration",
+        "volume_imbalance_proxy", "liquidity_shock_5d", "vwap_deviation",
+    ]
+    if include_liquidity_features and "log_market_cap" in df.columns:
+        df = _add_flow_residuals(df, flow_resid_cols, size_col="log_market_cap")
+
+    df = df.drop(columns=[c for c in ["market_cap", "avg_daily_volume_30d", "close", "volume"] if c in df.columns])
 
     logger.info(
         f"Training dataset: {len(df)} rows, "
         f"{df['symbol'].nunique()} symbols, "
-        f"{df['target_session_date'].min()} to {df['target_session_date'].max()}"
+        f"{df['target_session_date'].min()} to {df['target_session_date'].max()} "
+        f"(target_mode={target_mode}, horizon={target_horizon_days}, liquidity={include_liquidity_features})"
     )
     return df
 
