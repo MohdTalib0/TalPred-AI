@@ -1,0 +1,102 @@
+name: Daily EOD Pipeline
+
+on:
+  schedule:
+    # 9:30 PM ET = 01:30 UTC (Mon-Fri)
+    # yfinance EOD data typically available ~30 min after close
+    - cron: '30 1 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      start_step:
+        description: 'Start from step N (1-8, default 1)'
+        required: false
+        default: '1'
+
+env:
+  PYTHONIOENCODING: utf-8
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  REDIS_URL: ${{ secrets.REDIS_URL }}
+  FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+  FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+  OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+  OPENROUTER_MODEL_NAME: ${{ secrets.OPENROUTER_MODEL_NAME }}
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+  MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+
+jobs:
+  daily-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install lxml scipy
+
+      - name: Run daily pipeline
+        run: |
+          STEP="${{ github.event.inputs.start_step || '1' }}"
+          echo "Starting from step $STEP"
+          python -m scripts.daily_pipeline --step "$STEP"
+
+      - name: Commit paper trading results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add artifacts/paper_trading/ || true
+          if git diff --cached --quiet; then
+            echo "No paper trading changes to commit"
+          else
+            git commit -m "paper trading: $(date -u +%Y-%m-%d) daily update
+
+          Automated daily paper trading log and position update."
+            git push
+          fi
+
+      - name: Print paper trading dashboard
+        if: always()
+        run: python -m scripts.paper_trading_monitor --report-only
+
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## Daily Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date -u +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f artifacts/paper_trading/daily_log.csv ]; then
+            DAYS=$(wc -l < artifacts/paper_trading/daily_log.csv)
+            DAYS=$((DAYS - 1))
+            echo "**Paper trading days logged:** $DAYS" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "<details><summary>Latest entries</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -5 artifacts/paper_trading/daily_log.csv >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No paper trading data yet." >> $GITHUB_STEP_SUMMARY
+          fi

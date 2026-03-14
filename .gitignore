@@ -39,3 +39,7 @@ htmlcov/
 
 .DS_Store
 Thumbs.db
+
+# Keep production model and paper trading artifacts (needed by CI pipeline)
+!artifacts/production_model/
+!artifacts/paper_trading/

@@ -17,6 +17,8 @@ Usage:
 
 import argparse
 import logging
+import subprocess
+import sys
 import time
 from datetime import date, timedelta
 
@@ -136,6 +138,31 @@ def step_7_monitoring(db):
         logger.exception("  Monitoring checks failed")
 
 
+def step_8_paper_trading(db):
+    """Run paper trading monitor (uses production model artifact)."""
+    logger.info("Step 8: Paper trading monitor")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "scripts.paper_trading_monitor"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"},
+        )
+        for line in result.stdout.strip().split("\n"):
+            if line.strip():
+                logger.info(f"  {line}")
+        if result.returncode != 0:
+            logger.warning(f"  Paper trading exited with code {result.returncode}")
+            for line in result.stderr.strip().split("\n")[-10:]:
+                if line.strip():
+                    logger.warning(f"  {line}")
+    except subprocess.TimeoutExpired:
+        logger.warning("  Paper trading monitor timed out (180s)")
+    except Exception:
+        logger.exception("  Paper trading monitor failed")
+
+
 STEPS = [
     step_1_calendar_sync,
     step_2_ingest_market,
@@ -144,12 +171,13 @@ STEPS = [
     step_5_generate_features,
     step_6_batch_predict,
     step_7_monitoring,
+    step_8_paper_trading,
 ]
 
 
 def main():
     parser = argparse.ArgumentParser(description="Daily EOD pipeline")
-    parser.add_argument("--step", type=int, default=1, help="Start from this step (1-7)")
+    parser.add_argument("--step", type=int, default=1, help="Start from this step (1-8)")
     args = parser.parse_args()
 
     db = SessionLocal()
