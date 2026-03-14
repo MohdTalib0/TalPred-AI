@@ -16,9 +16,12 @@ Usage:
 """
 
 import argparse
+import json
 import logging
+import os
+import pickle
 import time
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pandas as pd
 
@@ -311,6 +314,28 @@ def main():
                 dataset_version=args.dataset_version,
                 backtest_results=backtest_results,
             )
+
+        # ── Save production artifact locally ──
+        # Paper trading and batch prediction load from this path
+        # instead of downloading from DagHub (which is slow/unreliable).
+        prod_dir = os.path.join("artifacts", "production_model")
+        os.makedirs(prod_dir, exist_ok=True)
+        train_result["model"].save_model(os.path.join(prod_dir, "model.json"))
+        with open(os.path.join(prod_dir, "train_medians.pkl"), "wb") as f:
+            pickle.dump(train_result["train_medians"], f)
+        with open(os.path.join(prod_dir, "metadata.json"), "w") as f:
+            json.dump({
+                "model_version": model_version,
+                "mlflow_run_id": train_result["run_id"],
+                "feature_profile": args.feature_profile,
+                "feature_columns": train_result["feature_columns"],
+                "target_mode": args.target_mode,
+                "target_horizon_days": args.target_horizon_days,
+                "dataset_version": args.dataset_version,
+                "promoted": report.get("promoted", False),
+                "saved_at": datetime.now(UTC).isoformat() if not report.get("skipped") else None,
+            }, f, indent=2)
+        logger.info(f"  Local artifact saved → {prod_dir}/")
 
         elapsed = time.time() - t0
         logger.info(f"\n{'='*60}")
