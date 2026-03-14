@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -62,7 +63,16 @@ def step_2_ingest_market(db):
     try:
         symbols = _get_active_symbols(db)
         today = date.today()
-        result = ingest_universe(db, symbols, today - timedelta(days=5), today)
+        workers = max(1, int(os.getenv("MARKET_INGEST_WORKERS", "8")))
+        lookback_days = max(1, int(os.getenv("MARKET_INGEST_LOOKBACK_DAYS", "5")))
+        logger.info(f"  Market ingest config: workers={workers}, lookback_days={lookback_days}")
+        result = ingest_universe(
+            db,
+            symbols,
+            today - timedelta(days=lookback_days),
+            today,
+            max_workers=workers,
+        )
         logger.info(f"  Market ingestion complete: {result}")
     except Exception:
         logger.exception("  Market ingestion failed")

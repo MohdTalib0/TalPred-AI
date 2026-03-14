@@ -5,11 +5,13 @@ Invalid records are routed to the quarantine table.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime
 
 from sqlalchemy.orm import Session
 
 from src.connectors.market import fetch_daily_bars
+from src.db import SessionLocal
 from src.models.schema import MarketBarsDaily, QuarantineRecord
 
 logger = logging.getLogger(__name__)
@@ -91,10 +93,23 @@ def ingest_symbol(
             inserted += 1
 
     db.commit()
-    logger.info(
+    logger.debug(
         f"{symbol}: inserted={inserted}, updated={updated}, quarantined={quarantined}"
     )
     return {"inserted": inserted, "updated": updated, "quarantined": quarantined}
+
+
+def _ingest_symbol_isolated(
+    symbol: str,
+    start_date: date,
+    end_date: date,
+) -> tuple[str, dict]:
+    """Ingest one symbol with an isolated DB session (thread-safe)."""
+    db = SessionLocal()
+    try:
+        return symbol, ingest_symbol(db, symbol, start_date, end_date)
+    finally:
+        db.close()
 
 
 def ingest_universe(
@@ -102,23 +117,42 @@ def ingest_universe(
     symbols: list[str],
     start_date: date,
     end_date: date,
+    max_workers: int = 1,
 ) -> dict:
     """Ingest daily bars for entire symbol universe."""
     totals = {"inserted": 0, "updated": 0, "quarantined": 0, "failed_symbols": []}
 
-    for symbol in symbols:
-        try:
-            result = ingest_symbol(db, symbol, start_date, end_date)
-            totals["inserted"] += result["inserted"]
-            totals["updated"] += result["updated"]
-            totals["quarantined"] += result["quarantined"]
-        except Exception:
-            logger.exception(f"Failed to ingest {symbol}")
-            totals["failed_symbols"].append(symbol)
+    if max_workers <= 1:
+        for symbol in symbols:
+            try:
+                result = ingest_symbol(db, symbol, start_date, end_date)
+                totals["inserted"] += result["inserted"]
+                totals["updated"] += result["updated"]
+                totals["quarantined"] += result["quarantined"]
+            except Exception:
+                logger.exception(f"Failed to ingest {symbol}")
+                totals["failed_symbols"].append(symbol)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_ingest_symbol_isolated, symbol, start_date, end_date): symbol
+                for symbol in symbols
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    _, result = future.result()
+                    totals["inserted"] += result["inserted"]
+                    totals["updated"] += result["updated"]
+                    totals["quarantined"] += result["quarantined"]
+                except Exception:
+                    logger.exception(f"Failed to ingest {symbol}")
+                    totals["failed_symbols"].append(symbol)
 
     logger.info(
         f"Universe ingestion complete: {totals['inserted']} inserted, "
         f"{totals['updated']} updated, {totals['quarantined']} quarantined, "
-        f"{len(totals['failed_symbols'])} failed"
+        f"{len(totals['failed_symbols'])} failed "
+        f"(workers={max_workers})"
     )
     return totals
