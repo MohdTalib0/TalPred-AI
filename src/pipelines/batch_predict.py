@@ -11,9 +11,11 @@ Runs after market close once features are generated:
 import hashlib
 import logging
 import os
+import pickle
 from datetime import UTC, date, datetime, timedelta
 
 import mlflow
+import numpy as np
 import pandas as pd
 import shap
 import xgboost as xgb
@@ -21,15 +23,36 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.cache.redis_cache import cache_batch_predictions, get_redis_client
+from src.features.leakage import _add_cross_sectional_transforms
 from src.ml.promotion import get_production_model
 from src.ml.tracking import configure_mlflow
 from src.models.schema import CalibrationModel, Prediction
-from src.models.trainer import prepare_features
 
 logger = logging.getLogger(__name__)
 
 TOP_K_FACTORS = 5
 LOCAL_PROD_MODEL_PATH = os.path.join("artifacts", "production_model", "model.json")
+LOCAL_PROD_MEDIANS_PATH = os.path.join(
+    "artifacts", "production_model", "train_medians.pkl"
+)
+
+
+def _model_source_order() -> list[str]:
+    """Resolve model loading strategy from env.
+
+    PREDICT_MODEL_SOURCE values:
+      - mlflow_first (default): try MLflow URIs, then local file
+      - local_first: try local file first, then MLflow URIs
+    """
+    mode = os.getenv("PREDICT_MODEL_SOURCE", "mlflow_first").strip().lower()
+    if mode not in {"mlflow_first", "local_first"}:
+        logger.warning(
+            "Unknown PREDICT_MODEL_SOURCE=%s, defaulting to mlflow_first", mode
+        )
+        mode = "mlflow_first"
+    if mode == "local_first":
+        return ["local", "mlflow_model", "mlflow_live_model", "mlflow_root"]
+    return ["mlflow_model", "mlflow_live_model", "mlflow_root", "local"]
 
 
 def _prediction_id(symbol: str, target_date: date, model_version: str) -> str:
@@ -51,35 +74,45 @@ def load_production_model(db: Session) -> tuple:
 
     configure_mlflow()
     model = None
-    tried_model_uris = []
-    for model_uri in (
-        f"runs:/{reg.mlflow_run_id}/model",
-        f"runs:/{reg.mlflow_run_id}/live_model",
-        f"runs:/{reg.mlflow_run_id}",
-    ):
-        tried_model_uris.append(model_uri)
+    tried_locations: list[str] = []
+    load_plan = _model_source_order()
+    logger.info("Production model load plan: %s", " -> ".join(load_plan))
+    for source in load_plan:
+        if source == "local":
+            tried_locations.append(f"file:{LOCAL_PROD_MODEL_PATH}")
+            if os.path.exists(LOCAL_PROD_MODEL_PATH):
+                try:
+                    model = xgb.XGBClassifier()
+                    model.load_model(LOCAL_PROD_MODEL_PATH)
+                    logger.info(
+                        "Loaded production model artifact from local file %s",
+                        LOCAL_PROD_MODEL_PATH,
+                    )
+                    break
+                except Exception:
+                    continue
+            continue
+
+        if source == "mlflow_model":
+            model_uri = f"runs:/{reg.mlflow_run_id}/model"
+        elif source == "mlflow_live_model":
+            model_uri = f"runs:/{reg.mlflow_run_id}/live_model"
+        else:
+            model_uri = f"runs:/{reg.mlflow_run_id}"
+
+        tried_locations.append(model_uri)
         try:
             model = mlflow.xgboost.load_model(model_uri)
-            logger.info(f"Loaded production model artifact from {model_uri}")
+            logger.info("Loaded production model artifact from %s", model_uri)
             break
         except Exception:
             continue
 
     if model is None:
-        # Final fallback to local artifact persisted by train/promote flow.
-        if os.path.exists(LOCAL_PROD_MODEL_PATH):
-            model = xgb.XGBClassifier()
-            model.load_model(LOCAL_PROD_MODEL_PATH)
-            logger.warning(
-                "MLflow artifact load failed for %s. Falling back to local model at %s",
-                tried_model_uris,
-                LOCAL_PROD_MODEL_PATH,
-            )
-        else:
-            raise RuntimeError(
-                "Failed to load production model from MLflow artifacts "
-                f"{tried_model_uris} and no local fallback found at {LOCAL_PROD_MODEL_PATH}"
-            )
+        raise RuntimeError(
+            "Failed to load production model from all configured sources: "
+            f"{tried_locations}"
+        )
 
     calibrator = None
     cal_row = None
@@ -125,35 +158,24 @@ def load_latest_snapshots(db: Session, target_date: date | None = None) -> pd.Da
         )"""
         params = {}
 
-    result = db.execute(text(f"""
-        SELECT
-            snapshot_id, symbol, target_session_date,
-            rsi_14, momentum_5d, momentum_10d,
-            rolling_return_5d, rolling_return_20d, rolling_volatility_20d,
-            macd, macd_signal,
-            sector_return_1d, sector_return_5d,
-            benchmark_relative_return_1d,
-            news_sentiment_24h, news_sentiment_7d,
-            vix_level, sp500_momentum_200d, regime_label, dataset_version
+    result = db.execute(
+        text(
+            f"""
+        SELECT fs.*, s.sector
         FROM features_snapshot fs
+        LEFT JOIN symbols s ON s.symbol = fs.symbol
         WHERE 1=1 {date_filter}
-        ORDER BY symbol
-    """), params)
+        ORDER BY fs.symbol
+    """
+        ),
+        params,
+    )
 
     rows = result.fetchall()
     if not rows:
         return pd.DataFrame()
 
-    columns = [
-        "snapshot_id", "symbol", "target_session_date",
-        "rsi_14", "momentum_5d", "momentum_10d",
-        "rolling_return_5d", "rolling_return_20d", "rolling_volatility_20d",
-        "macd", "macd_signal",
-        "sector_return_1d", "sector_return_5d",
-        "benchmark_relative_return_1d",
-        "news_sentiment_24h", "news_sentiment_7d",
-        "vix_level", "sp500_momentum_200d", "regime_label", "dataset_version",
-    ]
+    columns = list(result.keys())
     df = pd.DataFrame(rows, columns=columns)
     df["target_session_date"] = pd.to_datetime(df["target_session_date"])
     return df
@@ -197,6 +219,163 @@ def compute_shap_factors(explainer: shap.TreeExplainer, X_row: pd.DataFrame) -> 
         return []
 
 
+def _align_features_to_model(model, X: pd.DataFrame) -> pd.DataFrame:
+    """Align inference matrix columns to the model's expected feature schema.
+
+    This prevents hard failures when a production model was trained with a
+    different feature profile than the current default prepare_features output.
+    Missing columns are filled with 0.0, extra columns are dropped.
+    """
+    expected = []
+    try:
+        booster = model.get_booster()
+        expected = list(booster.feature_names or [])
+    except Exception:
+        expected = []
+
+    if not expected:
+        return X
+
+    missing = [c for c in expected if c not in X.columns]
+    extras = [c for c in X.columns if c not in expected]
+
+    if missing:
+        for c in missing:
+            X[c] = 0.0
+    if extras:
+        X = X.drop(columns=extras, errors="ignore")
+
+    X = X[expected]
+    logger.info(
+        "Aligned inference features to model schema: expected=%s, missing_filled=%s, extras_dropped=%s",
+        len(expected),
+        len(missing),
+        len(extras),
+    )
+    return X
+
+
+def _load_local_train_medians() -> pd.Series | None:
+    if not os.path.exists(LOCAL_PROD_MEDIANS_PATH):
+        return None
+    try:
+        with open(LOCAL_PROD_MEDIANS_PATH, "rb") as f:
+            med = pickle.load(f)
+        if isinstance(med, pd.Series):
+            return med
+        if isinstance(med, dict):
+            return pd.Series(med)
+    except Exception:
+        logger.warning("Failed to load local train medians, using inference medians")
+    return None
+
+
+def _build_inference_matrix(
+    db: Session,
+    snapshots_df: pd.DataFrame,
+    expected_cols: list[str] | None,
+) -> pd.DataFrame:
+    """Build model-aligned inference matrix with training-style transforms."""
+    inf_df = snapshots_df.copy()
+    feature_date = inf_df["target_session_date"].iloc[0].date()
+
+    # Liquidity/size features are not persisted in features_snapshot, compute point-in-time values.
+    needs_liquidity = any(
+        c in (expected_cols or [])
+        for c in (
+            "log_market_cap",
+            "market_cap_rank",
+            "dollar_volume",
+            "dollar_volume_rank_market",
+            "turnover_ratio",
+        )
+    )
+    if needs_liquidity:
+        liq_rows = db.execute(
+            text(
+                """
+            SELECT mb.symbol, mb.close, mb.volume, s.market_cap
+            FROM market_bars_daily mb
+            JOIN symbols s ON s.symbol = mb.symbol
+            WHERE mb.date = :d
+              AND s.is_active = true
+            """
+            ),
+            {"d": feature_date},
+        ).fetchall()
+        if liq_rows:
+            liq_df = pd.DataFrame(
+                liq_rows, columns=["symbol", "close", "volume", "market_cap"]
+            )
+            liq_df["dollar_volume"] = liq_df["close"] * liq_df["volume"]
+            liq_df["log_market_cap"] = liq_df["market_cap"].clip(lower=1).map(
+                lambda v: float(np.log(v))
+            )
+            shares_float = (liq_df["market_cap"] / liq_df["close"]).clip(lower=1)
+            liq_df["turnover_ratio"] = liq_df["volume"] / shares_float
+            liq_df["market_cap_rank"] = liq_df["market_cap"].rank(pct=True)
+            liq_df["dollar_volume_rank_market"] = liq_df["dollar_volume"].rank(pct=True)
+            liq_cols = [
+                "symbol",
+                "dollar_volume",
+                "log_market_cap",
+                "turnover_ratio",
+                "market_cap_rank",
+                "dollar_volume_rank_market",
+            ]
+            inf_df = inf_df.merge(liq_df[liq_cols], on="symbol", how="left", suffixes=("", "_liq"))
+            for c in liq_cols[1:]:
+                if f"{c}_liq" in inf_df.columns:
+                    if c in inf_df.columns:
+                        inf_df[c] = inf_df[c].fillna(inf_df[f"{c}_liq"])
+                        inf_df = inf_df.drop(columns=[f"{c}_liq"])
+                    else:
+                        inf_df = inf_df.rename(columns={f"{c}_liq": c})
+
+    if "turnover_acceleration" not in inf_df.columns:
+        inf_df["turnover_acceleration"] = 0.0
+    else:
+        inf_df["turnover_acceleration"] = inf_df["turnover_acceleration"].fillna(0.0)
+
+    # Cross-sectional transforms expected by live model profile.
+    transform_cols = [
+        "momentum_20d",
+        "momentum_60d",
+        "volume_change_5d",
+        "volume_zscore_20d",
+        "rolling_volatility_20d",
+        "turnover_ratio",
+    ]
+    usable_transform_cols = [c for c in transform_cols if c in inf_df.columns]
+    if usable_transform_cols:
+        inf_df = _add_cross_sectional_transforms(inf_df, usable_transform_cols)
+
+    # Regime one-hot columns (e.g. regime_bull_high_vol).
+    if "regime_label" in inf_df.columns:
+        regime_dummies = pd.get_dummies(
+            inf_df["regime_label"], prefix="regime", dtype=float
+        )
+        inf_df = pd.concat([inf_df, regime_dummies], axis=1)
+
+    # Use model feature schema as source of truth.
+    if expected_cols:
+        for col in expected_cols:
+            if col not in inf_df.columns:
+                inf_df[col] = 0.0
+        X = inf_df[expected_cols].copy()
+    else:
+        X = inf_df.copy()
+
+    X = X.replace([np.inf, -np.inf], np.nan)
+    train_medians = _load_local_train_medians()
+    if train_medians is not None:
+        for col in X.columns:
+            if col in train_medians.index and X[col].isna().any():
+                X[col] = X[col].fillna(train_medians[col])
+    X = X.fillna(X.median(numeric_only=True)).fillna(0.0)
+    return X
+
+
 def run_batch_predictions(
     db: Session,
     target_date: date | None = None,
@@ -220,8 +399,14 @@ def run_batch_predictions(
         f"features_as_of={feature_date}, target={prediction_target}, model={reg.model_version}"
     )
 
-    snapshots_df["direction"] = 0
-    X, _, medians = prepare_features(snapshots_df)
+    expected_cols = []
+    try:
+        booster = model.get_booster()
+        expected_cols = list(booster.feature_names or [])
+    except Exception:
+        expected_cols = []
+    X = _build_inference_matrix(db, snapshots_df, expected_cols=expected_cols)
+    X = _align_features_to_model(model, X)
 
     raw_probs = model.predict_proba(X)[:, 1]
 

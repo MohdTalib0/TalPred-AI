@@ -162,7 +162,12 @@ def step_6_batch_predict(db):
     from src.pipelines.batch_predict import run_batch_predictions
     logger.info("Step 6: Batch predictions + cache update")
     try:
-        result = run_batch_predictions(db, compute_explanations=True)
+        compute_explanations = _as_bool_env("BATCH_PREDICT_EXPLANATIONS", default=False)
+        logger.info(f"  Batch predict config: compute_explanations={compute_explanations}")
+        result = run_batch_predictions(
+            db,
+            compute_explanations=compute_explanations,
+        )
         logger.info(
             f"  Predictions: {result.get('predictions', 0)}, "
             f"cached: {result.get('cached', 0)}, "
