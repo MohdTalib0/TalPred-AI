@@ -43,3 +43,6 @@ Thumbs.db
 # Keep production model and paper trading artifacts (needed by CI pipeline)
 !artifacts/production_model/
 !artifacts/paper_trading/
+
+# Local temp files produced by archive dry-runs
+artifacts/archive_tmp/

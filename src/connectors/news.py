@@ -6,6 +6,8 @@ import time
 from datetime import UTC, date, datetime
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from src.config import settings
 
@@ -13,6 +15,19 @@ logger = logging.getLogger(__name__)
 
 FINNHUB_NEWS_URL = "https://finnhub.io/api/v1/company-news"
 FINNHUB_GENERAL_URL = "https://finnhub.io/api/v1/news"
+
+_session = requests.Session()
+_session.mount(
+    "https://",
+    HTTPAdapter(
+        max_retries=Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+    ),
+)
 
 
 def fetch_news_finnhub(
@@ -32,15 +47,26 @@ def fetch_news_finnhub(
         "token": settings.finnhub_api_key,
     }
 
-    try:
-        resp = requests.get(FINNHUB_NEWS_URL, params=params, timeout=30)
-        resp.raise_for_status()
-        articles = resp.json()
-        if not isinstance(articles, list):
-            return []
-    except Exception:
-        logger.exception(f"Finnhub news request failed for {symbol}")
-        return []
+    articles = []
+    for attempt in range(3):
+        try:
+            resp = _session.get(FINNHUB_NEWS_URL, params=params, timeout=30)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                wait_s = float(retry_after) if retry_after else min(4.0, 1.5 * (attempt + 1))
+                time.sleep(wait_s)
+                continue
+            resp.raise_for_status()
+            parsed = resp.json()
+            if not isinstance(parsed, list):
+                return []
+            articles = parsed
+            break
+        except requests.RequestException:
+            if attempt == 2:
+                logger.warning("Finnhub news request failed for %s after retries", symbol)
+                return []
+            time.sleep(0.5 * (attempt + 1))
 
     return [_normalize_finnhub_article(a, symbol) for a in articles if a.get("headline")]
 
@@ -101,8 +127,11 @@ def fetch_news_for_symbols(
     seen_ids = set()
     all_articles = []
 
+    failed = 0
     for i, symbol in enumerate(symbols):
         articles = fetch_news_finnhub(symbol, from_date, to_date)
+        if not articles:
+            failed += 1
 
         for article in articles:
             if "_matched_symbols" not in article:
@@ -114,8 +143,16 @@ def fetch_news_for_symbols(
                 seen_ids.add(article["event_id"])
                 all_articles.append(article)
 
-        if (i + 1) % 30 == 0:
-            time.sleep(1)
+        # Free-tier safe pacing to reduce 429 bursts.
+        if (i + 1) % 20 == 0:
+            time.sleep(1.0)
+        else:
+            time.sleep(0.1)
 
-    logger.info(f"Fetched {len(all_articles)} unique articles for {len(symbols)} symbols")
+    logger.info(
+        "Fetched %s unique articles for %s symbols (empty_or_failed=%s)",
+        len(all_articles),
+        len(symbols),
+        failed,
+    )
     return all_articles

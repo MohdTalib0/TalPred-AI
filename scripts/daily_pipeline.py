@@ -24,6 +24,7 @@ import time
 from datetime import date, timedelta
 
 from dotenv import load_dotenv
+from sqlalchemy import text
 
 load_dotenv()
 
@@ -35,6 +36,13 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("daily_pipeline")
+
+
+def _as_bool_env(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _get_active_symbols(db) -> list[str]:
@@ -83,7 +91,14 @@ def step_3_ingest_news(db):
     from src.pipelines.ingest_news import ingest_news
     logger.info("Step 3: News ingestion")
     try:
+        if not _as_bool_env("NEWS_INGEST_ENABLED", default=False):
+            logger.info("  News ingestion skipped (NEWS_INGEST_ENABLED=false)")
+            return
         symbols = _get_active_symbols(db)
+        symbol_limit = max(1, int(os.getenv("NEWS_SYMBOL_LIMIT", "150")))
+        if symbol_limit < len(symbols):
+            symbols = symbols[:symbol_limit]
+        logger.info(f"  News ingest config: symbols={len(symbols)}")
         today = date.today()
         result = ingest_news(db, symbols, today - timedelta(days=2), today)
         logger.info(f"  News ingestion complete: {result}")
@@ -104,14 +119,39 @@ def step_4_ingest_macro(db):
 
 
 def step_5_generate_features(db):
-    """Generate features for latest session (incremental)."""
-    from src.features.engine import generate_features, save_snapshots
+    """Generate features for latest session and persist sector returns."""
+    from src.features.engine import (
+        compute_sector_returns,
+        generate_features,
+        load_market_window,
+        load_sector_map,
+        save_sector_returns,
+        save_snapshots,
+    )
     logger.info("Step 5: Feature generation")
     try:
         symbols = _get_active_symbols(db)
         snapshots = generate_features(db, symbols, target_dates=None)
         saved = save_snapshots(db, snapshots)
         logger.info(f"  Features generated: {saved} snapshots")
+
+        # Persist latest sector returns daily so monitoring/audits can query DB.
+        latest_bar = db.execute(text("SELECT MAX(date) FROM market_bars_daily")).scalar()
+        if latest_bar:
+            lookback_days = max(30, int(os.getenv("SECTOR_RETURNS_LOOKBACK_DAYS", "120")))
+            market_df = load_market_window(db, symbols, lookback_days=lookback_days)
+            sector_map = load_sector_map(db)
+            sector_df = compute_sector_returns(market_df, sector_map)
+            if not sector_df.empty:
+                sector_df = sector_df[sector_df["date"].dt.date == latest_bar]
+                saved_sector = save_sector_returns(db, sector_df)
+                logger.info(
+                    f"  Sector returns saved: {saved_sector} rows (date={latest_bar})"
+                )
+            else:
+                logger.info("  Sector returns skipped: no sector return rows generated")
+        else:
+            logger.info("  Sector returns skipped: no market bars available")
     except Exception:
         logger.exception("  Feature generation failed")
 
@@ -149,7 +189,10 @@ def step_7_monitoring(db):
 
 
 def step_8_paper_trading(db):
-    """Run paper trading monitor (uses production model artifact)."""
+    """Run paper monitor and persist daily simulation run/trades to DB."""
+    from src.models.schema import SimulationRun
+    from src.simulation.engine import run_simulation
+
     logger.info("Step 8: Paper trading monitor")
     try:
         result = subprocess.run(
@@ -171,6 +214,76 @@ def step_8_paper_trading(db):
         logger.warning("  Paper trading monitor timed out (180s)")
     except Exception:
         logger.exception("  Paper trading monitor failed")
+
+    # Persist DB-native simulation/paper-trade records for daily tracking.
+    try:
+        sim_date = db.execute(
+            text("""
+                SELECT MAX(p.target_date)
+                FROM predictions p
+                WHERE p.target_date <= :today
+                  AND EXISTS (
+                      SELECT 1
+                      FROM market_bars_daily mb
+                      WHERE mb.date = p.target_date
+                  )
+            """),
+            {"today": date.today()},
+        ).scalar()
+
+        if not sim_date:
+            logger.info("  DB simulation skipped: no eligible target_date available")
+            return
+
+        model_version = db.execute(
+            text("""
+                SELECT model_version
+                FROM predictions
+                WHERE target_date = :td
+                GROUP BY model_version
+                ORDER BY COUNT(*) DESC, MAX(as_of_time) DESC
+                LIMIT 1
+            """),
+            {"td": sim_date},
+        ).scalar()
+
+        existing = (
+            db.query(SimulationRun)
+            .filter(
+                SimulationRun.start_date == sim_date,
+                SimulationRun.end_date == sim_date,
+                SimulationRun.model_version == model_version,
+                SimulationRun.status == "completed",
+            )
+            .first()
+        )
+        if existing:
+            logger.info(
+                f"  DB simulation skipped: already exists for {sim_date} "
+                f"(run_id={existing.run_id})"
+            )
+            return
+
+        sim_result = run_simulation(
+            db,
+            start_date=sim_date,
+            end_date=sim_date,
+            min_confidence_trade=float(os.getenv("MIN_CONFIDENCE_TRADE", "0.60")),
+            max_position=float(os.getenv("MAX_POSITION", "0.05")),
+            top_n=int(os.getenv("PAPER_TOP_N", "20")),
+            model_version=model_version,
+        )
+        if "error" in sim_result:
+            logger.warning(
+                f"  DB simulation failed for {sim_date}: {sim_result['error']}"
+            )
+        else:
+            logger.info(
+                f"  DB simulation saved: run_id={sim_result['run_id']}, "
+                f"trades={sim_result.get('n_trades', 0)}, days={sim_result.get('n_trading_days', 0)}"
+            )
+    except Exception:
+        logger.exception("  DB simulation persistence failed")
 
 
 STEPS = [

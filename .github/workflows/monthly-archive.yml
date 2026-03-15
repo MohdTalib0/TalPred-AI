@@ -1,0 +1,72 @@
+name: Monthly Archive to Supabase Storage
+
+on:
+  schedule:
+    # 03:15 UTC on day 2 of every month
+    - cron: '15 3 2 * *'
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: 'Set true to upload/delete (false = dry-run)'
+        required: false
+        default: 'false'
+      max_months:
+        description: 'Max months per table (0 = all)'
+        required: false
+        default: '2'
+
+env:
+  PYTHONIOENCODING: utf-8
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  REDIS_URL: ${{ secrets.REDIS_URL }}
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  SUPABASE_ARCHIVE_BUCKET: ${{ secrets.SUPABASE_ARCHIVE_BUCKET }}
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run archive job
+        run: |
+          EXECUTE_INPUT="${{ github.event.inputs.execute || 'true' }}"
+          MAX_MONTHS="${{ github.event.inputs.max_months || '2' }}"
+          CMD="python -m scripts.archive_to_supabase_storage --max-months \"$MAX_MONTHS\""
+          if [ "$EXECUTE_INPUT" = "true" ]; then
+            CMD="$CMD --execute"
+          fi
+          echo "Executing: $CMD"
+          eval "$CMD"
+
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## Monthly Archive Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date -u +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Execute mode:** ${{ github.event.inputs.execute || 'true' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Max months/table:** ${{ github.event.inputs.max_months || '2' }}" >> $GITHUB_STEP_SUMMARY

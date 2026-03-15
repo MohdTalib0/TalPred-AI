@@ -1,0 +1,77 @@
+name: News And Sentiment Refresh
+
+on:
+  schedule:
+    # Tue/Thu/Sat at 01:45 UTC
+    - cron: "45 1 * * 2,4,6"
+  workflow_dispatch:
+
+env:
+  PYTHONIOENCODING: utf-8
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+  OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+  OPENROUTER_MODEL_NAME: ${{ secrets.OPENROUTER_MODEL_NAME }}
+
+jobs:
+  refresh-news-sentiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate DATABASE_URL format (Supabase pooler)
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          from urllib.parse import urlparse
+
+          url = os.environ.get("DATABASE_URL", "")
+          if not url:
+              print("ERROR: DATABASE_URL secret is empty.")
+              sys.exit(1)
+
+          p = urlparse(url)
+          host = p.hostname or ""
+          user = p.username or ""
+          port = p.port
+
+          if "pooler.supabase.com" not in host:
+              print("ERROR: DATABASE_URL must use Supabase pooler host.")
+              sys.exit(1)
+          if "." not in user:
+              print("ERROR: Pooler user must be postgres.<project-ref>.")
+              sys.exit(1)
+          if port != 6543:
+              print("WARNING: Expected pooler port 6543.")
+          PY
+
+      - name: Run news ingestion + sentiment scoring
+        run: |
+          python -m scripts.backfill_news \
+            --days 2 \
+            --symbol-limit 50 \
+            --score-recent-days 3 \
+            --score-batch 50 \
+            --workers 8

@@ -37,6 +37,14 @@ def main():
     parser = argparse.ArgumentParser(description="Backfill news + sentiment")
     parser.add_argument("--days", type=int, default=29, help="Days to look back (NewsAPI free = 30 max)")
     parser.add_argument("--score-batch", type=int, default=50, help="Headlines per LLM batch")
+    parser.add_argument("--workers", type=int, default=8, help="Parallel workers for sentiment scoring")
+    parser.add_argument("--symbol-limit", type=int, default=0, help="Limit active symbols (0 = all)")
+    parser.add_argument(
+        "--score-recent-days",
+        type=int,
+        default=0,
+        help="Only score unscored headlines published in last N days (0 = all unscored)",
+    )
     parser.add_argument("--skip-ingest", action="store_true", help="Skip ingestion, only score")
     args = parser.parse_args()
 
@@ -47,6 +55,8 @@ def main():
         row.symbol for row in
         db.query(Symbol).filter(Symbol.is_active.is_(True)).all()
     ]
+    if args.symbol_limit and args.symbol_limit > 0:
+        symbols = symbols[: args.symbol_limit]
     logger.info(f"Universe: {len(symbols)} active symbols")
 
     to_date = date.today()
@@ -78,7 +88,11 @@ def main():
 
     # Step 2: Score unscored headlines using parallel processing
     logger.info("Scoring unscored headlines (parallel, 8 workers)...")
-    unscored = db.query(NewsEvent).filter(NewsEvent.sentiment_score.is_(None)).all()
+    unscored_q = db.query(NewsEvent).filter(NewsEvent.sentiment_score.is_(None))
+    if args.score_recent_days and args.score_recent_days > 0:
+        cutoff = datetime.now(UTC) - timedelta(days=args.score_recent_days)
+        unscored_q = unscored_q.filter(NewsEvent.published_time >= cutoff)
+    unscored = unscored_q.all()
     logger.info(f"  {len(unscored)} unscored headlines found")
 
     mega_batch = 400
@@ -88,7 +102,7 @@ def main():
         chunk = unscored[start : start + mega_batch]
         headlines = [e.headline for e in chunk]
 
-        results = score_headlines(headlines, batch_size=50, workers=8)
+        results = score_headlines(headlines, batch_size=args.score_batch, workers=args.workers)
 
         count = 0
         for event, result in zip(chunk, results):
