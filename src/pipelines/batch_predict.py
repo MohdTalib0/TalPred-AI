@@ -197,17 +197,13 @@ def resolve_next_trading_day(db: Session, feature_date: date) -> date:
     return next_day
 
 
-def compute_shap_factors(explainer: shap.TreeExplainer, X_row: pd.DataFrame) -> list[dict]:
-    """Compute top SHAP feature contributions for a single prediction."""
+def compute_shap_factors_from_vector(
+    feature_names: list[str],
+    shap_vector: np.ndarray,
+) -> list[dict]:
+    """Compute top SHAP contributions from a precomputed SHAP vector."""
     try:
-        shap_values = explainer.shap_values(X_row)
-
-        if isinstance(shap_values, list):
-            sv = shap_values[1][0]
-        else:
-            sv = shap_values[0]
-
-        feature_impacts = list(zip(X_row.columns, sv))
+        feature_impacts = list(zip(feature_names, shap_vector))
         feature_impacts.sort(key=lambda x: abs(x[1]), reverse=True)
 
         return [
@@ -311,7 +307,9 @@ def _build_inference_matrix(
             liq_df["log_market_cap"] = liq_df["market_cap"].clip(lower=1).map(
                 lambda v: float(np.log(v))
             )
-            shares_float = (liq_df["market_cap"] / liq_df["close"]).clip(lower=1)
+            shares_float = (liq_df["market_cap"] / liq_df["close"].clip(lower=0.01)).clip(
+                lower=1
+            )
             liq_df["turnover_ratio"] = liq_df["volume"] / shares_float
             liq_df["market_cap_rank"] = liq_df["market_cap"].rank(pct=True)
             liq_df["dollar_volume_rank_market"] = liq_df["dollar_volume"].rank(pct=True)
@@ -420,9 +418,15 @@ def run_batch_predictions(
         cal_probs = raw_probs
 
     explainer = None
+    shap_matrix = None
     if compute_explanations:
         try:
             explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X)
+            if isinstance(shap_values, list):
+                shap_matrix = np.asarray(shap_values[1])
+            else:
+                shap_matrix = np.asarray(shap_values)
         except Exception:
             logger.warning("Failed to create SHAP explainer, skipping explanations")
 
@@ -437,8 +441,11 @@ def run_batch_predictions(
             direction = "up" if prob_up >= 0.5 else "down"
 
             factors = []
-            if explainer is not None:
-                factors = compute_shap_factors(explainer, X.iloc[[i]])
+            if explainer is not None and shap_matrix is not None and i < len(shap_matrix):
+                factors = compute_shap_factors_from_vector(
+                    list(X.columns),
+                    np.asarray(shap_matrix[i]),
+                )
 
             pred_dict = {
                 "prediction_id": _prediction_id(
