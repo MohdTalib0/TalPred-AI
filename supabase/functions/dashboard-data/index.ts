@@ -154,7 +154,7 @@ Deno.serve(async (req) => {
       workflows,
     });
   } catch (err) {
-    return json(500, { error: String(err) });
+    return json(500, { error: formatError(err) });
   }
 });
 
@@ -234,7 +234,15 @@ async function countRows(
     for (const [k, v] of Object.entries(opts.gte)) q = q.gte(k, v);
   }
   const { count, error } = await q;
-  if (error) throw error;
+  if (error) {
+    if (error.code === "57014") {
+      console.warn(`[countRows:${table}] statement timeout, returning fallback count=0`);
+      return 0;
+    }
+    throw new Error(
+      `[countRows:${table}] ${error.message} (code=${error.code ?? "n/a"}, details=${error.details ?? "n/a"})`,
+    );
+  }
   return count ?? 0;
 }
 
@@ -263,7 +271,15 @@ async function selectRows(
     q = q.limit(opts.limit);
   }
   const { data, error } = await q;
-  if (error) throw error;
+  if (error) {
+    if (error.code === "57014") {
+      console.warn(`[selectRows:${table}] statement timeout, returning fallback []`);
+      return [];
+    }
+    throw new Error(
+      `[selectRows:${table}] ${error.message} (code=${error.code ?? "n/a"}, details=${error.details ?? "n/a"})`,
+    );
+  }
   return data ?? [];
 }
 
@@ -310,4 +326,13 @@ function isoTimestampDaysAgo(days: number): string {
 function round(v: number, n: number): number {
   const p = 10 ** n;
   return Math.round(v * p) / p;
+}
+
+function formatError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }
