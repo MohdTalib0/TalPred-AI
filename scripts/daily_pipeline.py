@@ -153,6 +153,7 @@ def step_5_generate_features(db):
         else:
             logger.info("  Sector returns skipped: no market bars available")
     except Exception:
+        db.rollback()
         logger.exception("  Feature generation failed")
 
 
@@ -168,6 +169,7 @@ def step_6_batch_predict(db):
             f"errors: {result.get('errors', 0)}"
         )
     except Exception:
+        db.rollback()
         logger.exception("  Batch prediction failed")
 
 
@@ -185,6 +187,7 @@ def step_7_monitoring(db):
             for alert in report["alert_details"]:
                 logger.warning(f"  ALERT [{alert['level']}] {alert['check']}: {alert['detail']}")
     except Exception:
+        db.rollback()
         logger.exception("  Monitoring checks failed")
 
 
@@ -213,6 +216,7 @@ def step_8_paper_trading(db):
     except subprocess.TimeoutExpired:
         logger.warning("  Paper trading monitor timed out (180s)")
     except Exception:
+        db.rollback()
         logger.exception("  Paper trading monitor failed")
 
     # Persist DB-native simulation/paper-trade records for daily tracking.
@@ -283,6 +287,7 @@ def step_8_paper_trading(db):
                 f"trades={sim_result.get('n_trades', 0)}, days={sim_result.get('n_trading_days', 0)}"
             )
     except Exception:
+        db.rollback()
         logger.exception("  DB simulation persistence failed")
 
 

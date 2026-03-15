@@ -45,6 +45,9 @@ def load_production_model(db: Session) -> tuple:
     reg = get_production_model(db)
     if not reg:
         raise RuntimeError("No production model found in registry")
+    # End SELECT transaction before long artifact download so pooled DB connections
+    # don't go stale while MLflow fetches model files.
+    db.rollback()
 
     configure_mlflow()
     model = None
@@ -79,11 +82,25 @@ def load_production_model(db: Session) -> tuple:
             )
 
     calibrator = None
-    cal_row = (
-        db.query(CalibrationModel)
-        .filter(CalibrationModel.model_version == reg.model_version)
-        .first()
-    )
+    cal_row = None
+    try:
+        cal_row = (
+            db.query(CalibrationModel)
+            .filter(CalibrationModel.model_version == reg.model_version)
+            .first()
+        )
+    except Exception:
+        # One retry after resetting failed transaction/connection state.
+        db.rollback()
+        try:
+            cal_row = (
+                db.query(CalibrationModel)
+                .filter(CalibrationModel.model_version == reg.model_version)
+                .first()
+            )
+        except Exception:
+            logger.warning("Failed to query calibration model, using raw probabilities")
+            cal_row = None
     if cal_row and cal_row.artifact_uri:
         try:
             calibrator = mlflow.sklearn.load_model(cal_row.artifact_uri)
