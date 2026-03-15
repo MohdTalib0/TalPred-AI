@@ -49,8 +49,11 @@ def load_production_model(db: Session) -> tuple:
     configure_mlflow()
     model = None
     tried_model_uris = []
-    for artifact_name in ("model", "live_model"):
-        model_uri = f"runs:/{reg.mlflow_run_id}/{artifact_name}"
+    for model_uri in (
+        f"runs:/{reg.mlflow_run_id}/model",
+        f"runs:/{reg.mlflow_run_id}/live_model",
+        f"runs:/{reg.mlflow_run_id}",
+    ):
         tried_model_uris.append(model_uri)
         try:
             model = mlflow.xgboost.load_model(model_uri)
