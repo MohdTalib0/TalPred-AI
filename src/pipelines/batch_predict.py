@@ -405,6 +405,19 @@ def run_batch_predictions(
         expected_cols = []
     X = _build_inference_matrix(db, snapshots_df, expected_cols=expected_cols)
     X = _align_features_to_model(model, X)
+    if expected_cols and len(X.columns) != len(expected_cols):
+        logger.error(
+            "schema mismatch detected: expected_cols=%s, actual_cols=%s",
+            len(expected_cols),
+            len(X.columns),
+        )
+    if expected_cols and list(X.columns) != list(expected_cols):
+        logger.error(
+            "schema mismatch detected: column order/name mismatch "
+            "(expected_head=%s, actual_head=%s)",
+            expected_cols[:5],
+            list(X.columns)[:5],
+        )
 
     raw_probs = model.predict_proba(X)[:, 1]
 
