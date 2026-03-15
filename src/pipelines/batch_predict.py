@@ -10,11 +10,13 @@ Runs after market close once features are generated:
 
 import hashlib
 import logging
+import os
 from datetime import UTC, date, datetime, timedelta
 
 import mlflow
 import pandas as pd
 import shap
+import xgboost as xgb
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -27,6 +29,7 @@ from src.models.trainer import prepare_features
 logger = logging.getLogger(__name__)
 
 TOP_K_FACTORS = 5
+LOCAL_PROD_MODEL_PATH = os.path.join("artifacts", "production_model", "model.json")
 
 
 def _prediction_id(symbol: str, target_date: date, model_version: str) -> str:
@@ -44,8 +47,33 @@ def load_production_model(db: Session) -> tuple:
         raise RuntimeError("No production model found in registry")
 
     configure_mlflow()
-    model_uri = f"runs:/{reg.mlflow_run_id}/model"
-    model = mlflow.xgboost.load_model(model_uri)
+    model = None
+    tried_model_uris = []
+    for artifact_name in ("model", "live_model"):
+        model_uri = f"runs:/{reg.mlflow_run_id}/{artifact_name}"
+        tried_model_uris.append(model_uri)
+        try:
+            model = mlflow.xgboost.load_model(model_uri)
+            logger.info(f"Loaded production model artifact from {model_uri}")
+            break
+        except Exception:
+            continue
+
+    if model is None:
+        # Final fallback to local artifact persisted by train/promote flow.
+        if os.path.exists(LOCAL_PROD_MODEL_PATH):
+            model = xgb.XGBClassifier()
+            model.load_model(LOCAL_PROD_MODEL_PATH)
+            logger.warning(
+                "MLflow artifact load failed for %s. Falling back to local model at %s",
+                tried_model_uris,
+                LOCAL_PROD_MODEL_PATH,
+            )
+        else:
+            raise RuntimeError(
+                "Failed to load production model from MLflow artifacts "
+                f"{tried_model_uris} and no local fallback found at {LOCAL_PROD_MODEL_PATH}"
+            )
 
     calibrator = None
     cal_row = (
