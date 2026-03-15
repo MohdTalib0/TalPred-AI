@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TalPred Ops Dashboard</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>TalPred Ops Dashboard</h1>
+      <p>Daily activity, monitoring, workflow health, and prediction feed.</p>
+      <button id="refresh-btn">Refresh</button>
+      <span id="last-updated"></span>
+    </header>
+
+    <main>
+      <section class="grid cards-4">
+        <article class="card">
+          <h2>API Health</h2>
+          <div id="health-status">-</div>
+          <small id="health-meta"></small>
+        </article>
+        <article class="card">
+          <h2>Production Model</h2>
+          <div id="model-version">-</div>
+          <small id="model-meta"></small>
+        </article>
+        <article class="card">
+          <h2>Monitoring Status</h2>
+          <div id="monitoring-overall">-</div>
+          <small id="monitoring-alerts"></small>
+        </article>
+        <article class="card">
+          <h2>Prediction Feed</h2>
+          <div id="prediction-count">-</div>
+          <small id="prediction-meta"></small>
+        </article>
+      </section>
+
+      <section class="grid cards-2">
+        <article class="card">
+          <h2>Workflow Runs</h2>
+          <div id="workflow-list" class="list"></div>
+        </article>
+        <article class="card">
+          <h2>Monitoring Alerts</h2>
+          <div id="alerts-list" class="list"></div>
+        </article>
+      </section>
+
+      <section class="card">
+        <h2>Latest Predictions</h2>
+        <table id="predictions-table">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Target Date</th>
+              <th>Direction</th>
+              <th>Prob Up</th>
+              <th>Confidence</th>
+              <th>Model</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

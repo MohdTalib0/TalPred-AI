@@ -1,0 +1,14 @@
+[build]
+  command = "npm --prefix dashboard-react install && npm --prefix dashboard-react run build"
+  publish = "dashboard-react/dist"
+  functions = "netlify/functions"
+
+[[redirects]]
+  from = "/api/proxy"
+  to = "/.netlify/functions/api-proxy"
+  status = 200
+
+[[redirects]]
+  from = "/api/workflows"
+  to = "/.netlify/functions/github-workflows"
+  status = 200
