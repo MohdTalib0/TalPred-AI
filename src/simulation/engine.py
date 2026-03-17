@@ -401,12 +401,23 @@ def _compute_metrics(
     }
 
 
+def _sanitize_trade(trade: dict) -> dict:
+    """Convert numpy scalars to native Python types for DB insertion."""
+    clean = {}
+    for k, v in trade.items():
+        if isinstance(v, (np.floating, np.integer)):
+            clean[k] = v.item()
+        else:
+            clean[k] = v
+    return clean
+
+
 def _save_trades(db: Session, trades: list[dict]) -> int:
     if not trades:
         return 0
 
     for t in trades:
-        db.add(PaperTrade(**t))
+        db.add(PaperTrade(**_sanitize_trade(t)))
 
     db.commit()
     return len(trades)
