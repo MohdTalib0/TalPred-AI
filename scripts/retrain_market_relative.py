@@ -400,13 +400,55 @@ def main():
             "ensemble": "xgb_lgb_ensemble",
         }.get(effective_mode, "xgboost")
 
+        full_metrics = {**train_result["metrics"]}
+
+        full_metrics["oos_accuracy"] = oos_metrics.get("oos_accuracy")
+        full_metrics["oos_auc_roc"] = oos_metrics.get("oos_auc_roc")
+        full_metrics["oos_ic"] = oos_metrics.get("oos_ic")
+        full_metrics["oos_n_rows"] = oos_metrics.get("oos_n_rows")
+        full_metrics["oos_status"] = oos_metrics.get("oos_status")
+
+        seed_accs = [r["accuracy"] for r in seed_results if r["accuracy"] is not None]
+        seed_aucs = [r["auc_roc"] for r in seed_results if r["auc_roc"] is not None]
+        seed_ics = [r["val_ic"] for r in seed_results if r["val_ic"] is not None]
+        full_metrics["seed_accuracy_mean"] = round(float(np.mean(seed_accs)), 5) if seed_accs else None
+        full_metrics["seed_accuracy_std"] = round(float(np.std(seed_accs)), 5) if seed_accs else None
+        full_metrics["seed_auc_mean"] = round(float(np.mean(seed_aucs)), 5) if seed_aucs else None
+        full_metrics["seed_auc_std"] = round(float(np.std(seed_aucs)), 5) if seed_aucs else None
+        full_metrics["seed_ic_mean"] = round(float(np.mean(seed_ics)), 5) if seed_ics else None
+        full_metrics["seed_ic_std"] = round(float(np.std(seed_ics)), 5) if seed_ics else None
+        full_metrics["n_seeds"] = len(seed_results)
+
+        if backtest_results:
+            agg = backtest_results["aggregate_metrics"]
+            full_metrics["wf_ic_mean"] = agg.get("ic_mean")
+            full_metrics["wf_ic_ir"] = agg.get("ic_ir")
+            full_metrics["wf_sharpe_net"] = agg.get("rank_long_short_sharpe_net")
+            full_metrics["wf_max_drawdown"] = agg.get("rank_max_drawdown_net")
+            full_metrics["wf_decile_monotonicity"] = agg.get("decile_monotonicity_spearman")
+            full_metrics["wf_deflated_sharpe"] = agg.get("rank_deflated_sharpe_ratio")
+
+        if calibration_result:
+            full_metrics["cal_raw_brier"] = calibration_result["metrics"].get("raw_brier")
+            full_metrics["cal_brier"] = calibration_result["metrics"].get("calibrated_brier")
+            full_metrics["cal_raw_ece"] = calibration_result["metrics"].get("raw_ece")
+            full_metrics["cal_ece"] = calibration_result["metrics"].get("calibrated_ece")
+
+        full_metrics["model_mode"] = effective_mode
+        full_metrics["feature_profile"] = args.feature_profile
+        full_metrics["n_features"] = len(train_result["feature_columns"])
+        full_metrics["target_mode"] = "market_relative"
+        full_metrics["target_horizon_days"] = args.target_horizon_days
+        full_metrics["training_rows"] = len(df_train_wf)
+        full_metrics["include_fundamentals"] = args.include_fundamentals
+
         model_version = register_model(
             db,
             mlflow_run_id=train_result["run_id"],
             algorithm=algo_name,
             training_window_start=_pd(training_window[0], start_date),
             training_window_end=_pd(training_window[1], end_date),
-            metrics=train_result["metrics"],
+            metrics=full_metrics,
             status="candidate",
         )
 

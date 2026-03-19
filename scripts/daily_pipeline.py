@@ -314,9 +314,9 @@ def step_9_paper_trading(db):
                 db,
                 start_date=sim_date,
                 end_date=sim_date,
-                min_confidence_trade=float(os.getenv("MIN_CONFIDENCE_TRADE", "0.60")),
-                max_position=float(os.getenv("MAX_POSITION", "0.05")),
-                top_n=int(os.getenv("PAPER_TOP_N", "20")),
+                min_confidence_trade=float(os.getenv("MIN_CONFIDENCE_TRADE", "0.65")),
+                max_position=float(os.getenv("MAX_POSITION", "0.10")),
+                top_n=int(os.getenv("PAPER_TOP_N", "10")),
                 model_version=model_version,
             )
             if "error" in sim_result:
@@ -324,10 +324,16 @@ def step_9_paper_trading(db):
                     f"  Legacy simulation failed for {sim_date}: {sim_result['error']}"
                 )
             else:
+                m = sim_result.get("metrics", {})
                 logger.info(
-                    f"  Legacy simulation saved: run_id={sim_result['run_id']}, "
-                    f"trades={sim_result.get('n_trades', 0)}"
+                    f"  DB simulation saved: run_id={sim_result['run_id']}, "
+                    f"trades={sim_result.get('n_trades', 0)}, days={sim_result.get('n_trading_days', 0)}"
                 )
+                ic_val = m.get("ic_mean")
+                ls_val = m.get("ls_spread_mean_bps")
+                dec_val = m.get("decile_spread_mean_bps")
+                if ic_val is not None:
+                    logger.info(f"  Signal health: IC={ic_val}, LS_spread={ls_val}bps, decile_spread={dec_val}bps")
     except Exception:
         db.rollback()
         logger.exception("  Legacy simulation persistence failed")

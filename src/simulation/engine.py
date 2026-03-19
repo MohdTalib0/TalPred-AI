@@ -275,6 +275,16 @@ def run_strategy_simulation(
     metrics = _compute_metrics(
         equity_curve, daily_returns, all_trades, cfg.starting_capital, benchmark_returns
     )
+
+    signal_health = _compute_signal_health(
+        predictions_df, prices_df, trading_dates
+    )
+    metrics["ic_mean"] = signal_health["ic_mean"]
+    metrics["ic_ir"] = signal_health["ic_ir"]
+    metrics["decile_spread_mean_bps"] = signal_health["decile_spread_mean_bps"]
+    metrics["ls_spread_mean_bps"] = signal_health["ls_spread_mean_bps"]
+    metrics["signal_health"] = signal_health["signal_health_details"]
+
     _save_trades(db, all_trades)
 
     sim_run.status = "completed"
@@ -322,11 +332,11 @@ def run_simulation(
     start_date: date,
     end_date: date,
     starting_capital: float = 100_000.0,
-    min_confidence_trade: float = 0.60,
-    max_position: float = 0.05,
+    min_confidence_trade: float = 0.65,
+    max_position: float = 0.10,
     transaction_cost_bps: float = 10.0,
     slippage_bps: float = 5.0,
-    top_n: int = 20,
+    top_n: int = 10,
     model_version: str | None = None,
     enable_regime_guard: bool = True,
     vix_quarter_exposure_below: float = 12.0,
@@ -489,18 +499,36 @@ def run_simulation(
         round(float(np.mean(live_ic_trace)), 5) if live_ic_trace else None
     )
 
+    signal_health = _compute_signal_health(
+        predictions_df, prices_df, trading_dates
+    )
+    metrics["ic_mean"] = signal_health["ic_mean"]
+    metrics["ic_ir"] = signal_health["ic_ir"]
+    metrics["decile_spread_mean_bps"] = signal_health["decile_spread_mean_bps"]
+    metrics["ls_spread_mean_bps"] = signal_health["ls_spread_mean_bps"]
+    metrics["signal_health"] = signal_health["signal_health_details"]
+
     _save_trades(db, all_trades)
 
     sim_run.status = "completed"
     sim_run.result_metrics = metrics
     db.commit()
 
+    ic_str = f", IC={signal_health['ic_mean']}" if signal_health['ic_mean'] else ""
+    ls_str = (
+        f", LS_spread={signal_health['ls_spread_mean_bps']}bps"
+        if signal_health['ls_spread_mean_bps'] else ""
+    )
     logger.info(
-        "Simulation %s [legacy] complete: return=%.2f%%, sharpe=%.3f, max_dd=%.2f%%",
+        "Simulation %s [legacy] complete: return=%.2f%%, sharpe=%.3f, "
+        "max_dd=%.2f%%, trades=%d%s%s",
         run_id,
         metrics["total_return_pct"],
         metrics["sharpe_ratio"],
         metrics["max_drawdown_pct"],
+        metrics["total_trades"],
+        ic_str,
+        ls_str,
     )
 
     return {
@@ -770,6 +798,101 @@ def _compute_live_rolling_ic(
     if not daily_ics:
         return None
     return float(np.mean(daily_ics))
+
+
+def _compute_signal_health(
+    all_preds: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    trading_dates: list,
+    n_deciles: int = 10,
+) -> dict:
+    """Compute daily IC, decile spread, and long-short spread.
+
+    Uses the FULL cross-section of predictions (all symbols, not just traded),
+    because signal health measures the model's ranking ability over the universe.
+
+    Returns dict with daily traces and aggregates.
+    """
+    daily_ics: list[float] = []
+    daily_decile_spreads: list[float] = []
+    daily_ls_spreads_bps: list[float] = []
+    daily_details: list[dict] = []
+
+    for td in trading_dates:
+        day_preds = all_preds[all_preds["target_date"] == td].copy()
+        if len(day_preds) < 20:
+            continue
+
+        returns_for_day = []
+        for _, pred in day_preds.iterrows():
+            price_row = prices_df[
+                (prices_df["symbol"] == pred["symbol"]) & (prices_df["date"] == td)
+            ]
+            if price_row.empty:
+                returns_for_day.append(np.nan)
+                continue
+            o = float(price_row.iloc[0]["open"])
+            c = float(price_row.iloc[0]["close"])
+            returns_for_day.append((c - o) / o if o > 0 else np.nan)
+
+        day_preds = day_preds.copy()
+        day_preds["realized_ret"] = returns_for_day
+        day_preds = day_preds.dropna(subset=["realized_ret", "probability_up"])
+
+        if len(day_preds) < 20:
+            continue
+
+        ic = float(day_preds["probability_up"].corr(
+            day_preds["realized_ret"], method="spearman"
+        ))
+        if pd.notna(ic):
+            daily_ics.append(ic)
+
+        day_preds["decile"] = pd.qcut(
+            day_preds["probability_up"], n_deciles, labels=False, duplicates="drop"
+        )
+        decile_returns = day_preds.groupby("decile")["realized_ret"].mean()
+        if len(decile_returns) >= 2:
+            top_ret = float(decile_returns.iloc[-1])
+            bot_ret = float(decile_returns.iloc[0])
+            spread = top_ret - bot_ret
+            daily_decile_spreads.append(spread)
+
+            ls_bps = spread * 10_000
+            daily_ls_spreads_bps.append(ls_bps)
+
+            daily_details.append({
+                "date": str(td),
+                "ic": round(ic, 5) if pd.notna(ic) else None,
+                "top_decile_ret_bps": round(top_ret * 10_000, 2),
+                "bot_decile_ret_bps": round(bot_ret * 10_000, 2),
+                "ls_spread_bps": round(ls_bps, 2),
+                "n_symbols": len(day_preds),
+            })
+
+    result: dict = {
+        "daily_ic_trace": [round(x, 5) for x in daily_ics],
+        "ic_mean": round(float(np.mean(daily_ics)), 5) if daily_ics else None,
+        "ic_std": round(float(np.std(daily_ics)), 5) if daily_ics else None,
+        "ic_ir": (
+            round(float(np.mean(daily_ics) / np.std(daily_ics)), 4)
+            if daily_ics and np.std(daily_ics) > 0 else None
+        ),
+        "decile_spread_mean_bps": (
+            round(float(np.mean(daily_decile_spreads)) * 10_000, 2)
+            if daily_decile_spreads else None
+        ),
+        "ls_spread_mean_bps": (
+            round(float(np.mean(daily_ls_spreads_bps)), 2)
+            if daily_ls_spreads_bps else None
+        ),
+        "ls_spread_daily_bps": (
+            [round(x, 2) for x in daily_ls_spreads_bps]
+            if daily_ls_spreads_bps else []
+        ),
+        "signal_health_details": daily_details,
+    }
+    return result
 
 
 def _newey_west_sharpe(returns: np.ndarray, lag: int = 4) -> float:
