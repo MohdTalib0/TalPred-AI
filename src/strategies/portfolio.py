@@ -152,7 +152,15 @@ class PortfolioConstructor:
         target_date: date,
         run_id: str,
     ) -> tuple[list[dict], float, float]:
-        """Convert signals to executable trade records.
+        """Convert signals to executable trade records (single-day O->C).
+
+        Designed for legacy single-day simulations where each position is
+        entered at open and exited at close on the same day.  Transaction
+        costs are charged as round-trip (entry + exit, ``* 2``).
+
+        For multi-day hold strategies, use ``compute_target_weights`` +
+        ``compute_rebalance_cost`` instead — those charge costs only on
+        the turnover delta between rebalance days.
 
         Returns:
             (trades, day_pnl, benchmark_return)

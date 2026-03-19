@@ -50,7 +50,10 @@ def calibrate_model(
     for feat_set in (X_fit, X_eval):
         for col in model_features:
             if col not in feat_set.columns:
-                feat_set[col] = 0
+                fill = 0
+                if medians is not None and col in medians.index:
+                    fill = float(medians[col])
+                feat_set[col] = fill
     X_fit = X_fit[model_features]
     X_eval = X_eval[model_features]
 
@@ -63,11 +66,17 @@ def calibrate_model(
     cal_probs = calibrated.predict_proba(X_eval)[:, 1]
     cal_brier = brier_score_loss(y_eval, cal_probs)
 
-    prob_true_raw, prob_pred_raw = calibration_curve(y_eval, raw_probs, n_bins=10, strategy="uniform")
-    prob_true_cal, prob_pred_cal = calibration_curve(y_eval, cal_probs, n_bins=10, strategy="uniform")
+    n_bins = 10
+    bin_edges = np.linspace(0, 1, n_bins + 1)
 
-    raw_ece = _expected_calibration_error(prob_true_raw, prob_pred_raw)
-    cal_ece = _expected_calibration_error(prob_true_cal, prob_pred_cal)
+    prob_true_raw, prob_pred_raw = calibration_curve(y_eval, raw_probs, n_bins=n_bins, strategy="uniform")
+    raw_bin_counts = np.histogram(raw_probs, bins=bin_edges)[0][: len(prob_true_raw)]
+
+    prob_true_cal, prob_pred_cal = calibration_curve(y_eval, cal_probs, n_bins=n_bins, strategy="uniform")
+    cal_bin_counts = np.histogram(cal_probs, bins=bin_edges)[0][: len(prob_true_cal)]
+
+    raw_ece = _expected_calibration_error(prob_true_raw, prob_pred_raw, raw_bin_counts)
+    cal_ece = _expected_calibration_error(prob_true_cal, prob_pred_cal, cal_bin_counts)
 
     logger.info(f"Calibration ({method}), eval on {len(df_eval)} held-out rows:")
     logger.info(f"  Raw  - Brier: {raw_brier:.4f}, ECE: {raw_ece:.4f}")
@@ -92,9 +101,23 @@ def calibrate_model(
     }
 
 
-def _expected_calibration_error(prob_true: np.ndarray, prob_pred: np.ndarray) -> float:
-    """Compute Expected Calibration Error."""
-    return np.mean(np.abs(prob_true - prob_pred))
+def _expected_calibration_error(
+    prob_true: np.ndarray,
+    prob_pred: np.ndarray,
+    bin_counts: np.ndarray | None = None,
+) -> float:
+    """Compute Expected Calibration Error (weighted by bin population).
+
+    When *bin_counts* is provided the metric is the standard
+    ECE = sum(n_k / N * |acc_k - conf_k|).  Without counts falls back
+    to unweighted mean (legacy behaviour).
+    """
+    gaps = np.abs(prob_true - prob_pred)
+    if bin_counts is not None and len(bin_counts) == len(gaps):
+        total = bin_counts.sum()
+        if total > 0:
+            return float(np.sum((bin_counts / total) * gaps))
+    return float(np.mean(gaps))
 
 
 def log_calibration_to_mlflow(calibration_result: dict, run_id: str | None = None):
@@ -103,12 +126,13 @@ def log_calibration_to_mlflow(calibration_result: dict, run_id: str | None = Non
 
     if run_id:
         with mlflow.start_run(run_id=run_id):
-            mlflow.log_metrics({
-                f"cal_{k}": v for k, v in metrics.items()
-            })
+            mlflow.log_metrics({f"cal_{k}": v for k, v in metrics.items()})
             mlflow.log_dict(calibration_result["calibration_curve"], "calibration_curve.json")
-    else:
+    elif mlflow.active_run():
         mlflow.log_metrics({f"cal_{k}": v for k, v in metrics.items()})
         mlflow.log_dict(calibration_result["calibration_curve"], "calibration_curve.json")
+    else:
+        logger.warning("No active MLflow run and no run_id provided; skipping MLflow logging")
+        return
 
     logger.info("Calibration results logged to MLflow")

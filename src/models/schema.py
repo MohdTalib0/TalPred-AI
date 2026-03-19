@@ -157,6 +157,16 @@ class FeaturesSnapshot(Base):
     vix_level = Column(Float)
     sp500_momentum_200d = Column(Float)
 
+    vol_adj_momentum_20d = Column(Float)
+    vol_adj_momentum_60d = Column(Float)
+    pct_from_52w_high = Column(Float)
+    idio_momentum_20d = Column(Float)
+    idio_momentum_60d = Column(Float)
+    vol_price_divergence = Column(Float)
+    vol_adj_momentum_20d_rank = Column(Float)
+    pct_from_52w_high_rank = Column(Float)
+    idio_momentum_20d_rank = Column(Float)
+
     accruals = Column(Float)
     roe_trend = Column(Float)
     earnings_momentum = Column(Float)
@@ -176,6 +186,7 @@ class ModelRegistry(Base):
     metrics = Column(JSONB)
     status = Column(String(20), default="candidate")
     created_at = Column(DateTime(timezone=True), default=_utcnow)
+    promoted_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class CalibrationModel(Base):

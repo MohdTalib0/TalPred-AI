@@ -13,11 +13,14 @@ Usage:
 
 import logging
 from datetime import date
+from types import SimpleNamespace
 
+import mlflow
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+from src.ml.tracking import configure_mlflow
 from src.models.trainer import (
     DEFAULT_PARAMS,
     FEATURE_PROFILES,
@@ -57,7 +60,12 @@ class EnsembleModel:
     the pipeline (predict, predict_proba, feature_importances_).
     """
 
-    def __init__(self, models: list, weights: list[float] | None = None):
+    def __init__(
+        self,
+        models: list,
+        weights: list[float] | None = None,
+        feature_names: list[str] | None = None,
+    ):
         if not models:
             raise ValueError(
                 "EnsembleModel requires at least one model. "
@@ -65,7 +73,7 @@ class EnsembleModel:
             )
         self.models = models
         self.weights = weights or [1.0 / len(models)] * len(models)
-        self._feature_names = None
+        self._feature_names: list[str] | None = feature_names
 
     @staticmethod
     def _ensure_2d(proba: np.ndarray, n_samples: int) -> np.ndarray:
@@ -94,14 +102,28 @@ class EnsembleModel:
 
     @property
     def feature_importances_(self) -> np.ndarray:
-        stacked = np.array([
-            model.feature_importances_ * w
-            for model, w in zip(self.models, self.weights)
-        ])
-        return stacked.sum(axis=0)
+        parts = []
+        for model, w in zip(self.models, self.weights):
+            imp = model.feature_importances_.copy()
+            total = imp.sum()
+            if total > 0:
+                imp = imp / total
+            parts.append(imp * w)
+        return np.array(parts).sum(axis=0)
 
     def get_booster(self):
-        return self.models[0].get_booster()
+        """Return a booster-like object exposing ``feature_names``.
+
+        Works for pure-XGBoost ensembles (delegates to models[0]) and
+        for mixed XGBoost/LightGBM ensembles (returns a lightweight
+        namespace backed by ``self._feature_names``).
+        """
+        if self._feature_names is not None:
+            return SimpleNamespace(feature_names=self._feature_names)
+        try:
+            return self.models[0].get_booster()
+        except AttributeError:
+            return SimpleNamespace(feature_names=None)
 
     @property
     def n_models(self) -> int:
@@ -194,7 +216,7 @@ def train_ensemble(
             "Check training data and parameters."
         )
 
-    ensemble = EnsembleModel(models)
+    ensemble = EnsembleModel(models, feature_names=list(common_cols))
 
     y_prob = ensemble.predict_proba(X_val)[:, 1]
     y_pred = ensemble.predict(X_val)
@@ -209,7 +231,6 @@ def train_ensemble(
         "model_names": model_names,
     }
 
-    # IC
     val_ic = float(pd.Series(y_prob).corr(
         pd.Series(y_val.values).astype(float), method="spearman",
     ))
@@ -227,11 +248,31 @@ def train_ensemble(
     train_start = str(df["target_session_date"].min()) if "target_session_date" in df.columns else None
     train_end = str(df["target_session_date"].max()) if "target_session_date" in df.columns else None
 
+    # Log to MLflow so ensemble models get a valid run_id for promotion
+    mlflow_run_id = None
+    try:
+        configure_mlflow()
+        with mlflow.start_run(run_name=f"ensemble_{feature_profile}") as run:
+            mlflow_run_id = run.info.run_id
+            mlflow.log_params({
+                "model_mode": "ensemble",
+                "feature_profile": feature_profile,
+                "n_models": ensemble.n_models,
+                "component_models": ",".join(model_names),
+            })
+            mlflow.log_metrics({
+                k: v for k, v in metrics.items()
+                if isinstance(v, (int, float))
+            })
+            mlflow.xgboost.log_model(models[0], "model")
+    except Exception:
+        logger.warning("MLflow logging failed for ensemble", exc_info=True)
+
     return {
         "model": ensemble,
         "model_mode": "ensemble",
         "metrics": metrics,
-        "run_id": None,
+        "run_id": mlflow_run_id,
         "feature_columns": list(common_cols),
         "importance": importance,
         "train_medians": train_medians,

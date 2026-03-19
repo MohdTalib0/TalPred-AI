@@ -167,16 +167,24 @@ def check_data_freshness(db: Session) -> dict:
 
 
 def check_model_performance(db: Session) -> dict:
-    """Check recent prediction accuracy against realized outcomes."""
+    """Check recent prediction accuracy against realized outcomes.
+
+    Filters to the current production model version so accuracy isn't
+    muddled by stale predictions from prior models with different
+    target modes (absolute vs market-relative).
+    """
     alerts = []
 
     result = db.execute(text("""
         SELECT
             COUNT(*) AS total,
-            SUM(CASE WHEN direction = realized_direction THEN 1 ELSE 0 END) AS correct
-        FROM predictions
-        WHERE realized_direction IS NOT NULL
-          AND target_date >= CURRENT_DATE - 30
+            SUM(CASE WHEN p.direction = p.realized_direction THEN 1 ELSE 0 END) AS correct
+        FROM predictions p
+        INNER JOIN model_registry mr
+            ON mr.model_version = p.model_version
+            AND mr.status = 'production'
+        WHERE p.realized_direction IS NOT NULL
+          AND p.target_date >= CURRENT_DATE - 30
     """))
     row = result.fetchone()
     total = row[0] or 0
@@ -308,6 +316,9 @@ def check_alpha_quality(db: Session) -> dict:
             p.realized_return,
             p.realized_direction
         FROM predictions p
+        INNER JOIN model_registry mr
+            ON mr.model_version = p.model_version
+            AND mr.status = 'production'
         WHERE p.realized_return IS NOT NULL
           AND p.target_date >= CURRENT_DATE - 60
         ORDER BY p.target_date, p.probability_up DESC
@@ -406,12 +417,15 @@ def check_feature_drift(db: Session) -> dict:
     alerts = []
     drift_scores = {}
 
-    feature_cols = [
+    _ALLOWED_DRIFT_COLS = frozenset({
         "rsi_14", "momentum_5d", "rolling_volatility_20d", "vix_level",
         "momentum_20d", "momentum_60d", "short_term_reversal",
-    ]
+    })
+    feature_cols = list(_ALLOWED_DRIFT_COLS)
 
     for col in feature_cols:
+        if col not in _ALLOWED_DRIFT_COLS:
+            continue
         result = db.execute(text(f"""
             SELECT
                 AVG(CASE WHEN target_session_date >= CURRENT_DATE - 7 THEN {col} END) AS recent_mean,
@@ -719,7 +733,6 @@ _OOD_FEATURES = [
     "rsi_14", "momentum_5d", "momentum_20d", "momentum_60d",
     "rolling_volatility_20d", "volume_change_5d", "volume_zscore_20d",
     "macd", "short_term_reversal", "volatility_expansion_5_20",
-    "log_market_cap", "turnover_ratio",
 ]
 
 _OOD_TRAIN_LOOKBACK_DAYS = 252

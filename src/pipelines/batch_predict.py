@@ -234,9 +234,9 @@ def compute_shap_factors_from_vector(
 def _align_features_to_model(model, X: pd.DataFrame) -> pd.DataFrame:
     """Align inference matrix columns to the model's expected feature schema.
 
-    This prevents hard failures when a production model was trained with a
-    different feature profile than the current default prepare_features output.
-    Missing columns are filled with 0.0, extra columns are dropped.
+    Missing columns are filled with training medians when available
+    (preserving the distribution centre), falling back to 0.0 for
+    one-hot / binary features.  Extra columns are dropped.
     """
     expected = []
     try:
@@ -252,8 +252,12 @@ def _align_features_to_model(model, X: pd.DataFrame) -> pd.DataFrame:
     extras = [c for c in X.columns if c not in expected]
 
     if missing:
+        train_medians = _load_local_train_medians()
         for c in missing:
-            X[c] = 0.0
+            fill = 0.0
+            if train_medians is not None and c in train_medians.index:
+                fill = float(train_medians[c])
+            X[c] = fill
     if extras:
         X = X.drop(columns=extras, errors="ignore")
 
@@ -390,11 +394,14 @@ def _compute_alpha_features(
         if spy_row and len(spy_row) >= 21:
             spy_closes = [float(r[0]) for r in reversed(spy_row)]
             spy_mom20 = (spy_closes[-1] / spy_closes[-21]) - 1
-            spy_mom60 = (
-                (spy_closes[-1] / spy_closes[-61]) - 1
-                if len(spy_closes) >= 61
-                else spy_mom20
-            )
+            if len(spy_closes) >= 61:
+                spy_mom60 = (spy_closes[-1] / spy_closes[-61]) - 1
+            else:
+                logger.warning(
+                    "SPY history < 61 bars (%d), using 20d momentum as 60d proxy",
+                    len(spy_closes),
+                )
+                spy_mom60 = spy_mom20
             inf_df["idio_momentum_20d"] = inf_df["momentum_20d"] - spy_mom20
             if "momentum_60d" in inf_df.columns:
                 inf_df["idio_momentum_60d"] = inf_df["momentum_60d"] - spy_mom60
@@ -549,9 +556,7 @@ def _build_inference_matrix(
     X = X.replace([np.inf, -np.inf], np.nan)
     train_medians = _load_local_train_medians()
     if train_medians is not None:
-        for col in X.columns:
-            if col in train_medians.index and X[col].isna().any():
-                X[col] = X[col].fillna(train_medians[col])
+        X = X.fillna(train_medians)
     X = X.fillna(X.median(numeric_only=True)).fillna(0.0)
     return X
 
@@ -591,17 +596,17 @@ def run_batch_predictions(
     X = _build_inference_matrix(db, snapshots_df, expected_cols=expected_cols)
     X = _align_features_to_model(model, X)
     if expected_cols and len(X.columns) != len(expected_cols):
-        logger.error(
-            "schema mismatch detected: expected_cols=%s, actual_cols=%s",
-            len(expected_cols),
-            len(X.columns),
+        raise RuntimeError(
+            f"Feature schema mismatch after alignment: "
+            f"expected {len(expected_cols)} cols, got {len(X.columns)}. "
+            f"Predictions would be corrupted — aborting."
         )
     if expected_cols and list(X.columns) != list(expected_cols):
-        logger.error(
-            "schema mismatch detected: column order/name mismatch "
-            "(expected_head=%s, actual_head=%s)",
-            expected_cols[:5],
-            list(X.columns)[:5],
+        raise RuntimeError(
+            f"Feature column order/name mismatch after alignment: "
+            f"expected_head={expected_cols[:5]}, "
+            f"actual_head={list(X.columns)[:5]}. "
+            f"Predictions would be corrupted — aborting."
         )
 
     raw_probs = model.predict_proba(X)[:, 1]
@@ -610,7 +615,7 @@ def run_batch_predictions(
         try:
             cal_probs = calibrator.predict_proba(X)[:, 1]
         except Exception:
-            logger.warning("Calibrator failed, using raw probabilities")
+            logger.warning("Calibrator failed, using raw probabilities", exc_info=True)
             cal_probs = raw_probs
     else:
         cal_probs = raw_probs
@@ -692,19 +697,41 @@ def run_batch_predictions(
 
 
 def _save_predictions(db: Session, predictions: list[dict]) -> int:
-    """Upsert predictions into the database."""
-    count = 0
-    for pred in predictions:
-        existing = db.query(Prediction).filter(
-            Prediction.prediction_id == pred["prediction_id"]
-        ).first()
+    """Bulk upsert predictions via INSERT ... ON CONFLICT DO UPDATE.
 
-        if existing:
-            for k, v in pred.items():
-                setattr(existing, k, v)
-        else:
-            db.add(Prediction(**pred))
-        count += 1
+    Preserves realized_return / realized_direction / outcome_recorded_at
+    that may have been written by the outcome backfill pipeline.
+    """
+    if not predictions:
+        return 0
 
-    db.commit()
-    return count
+    upsert_cols = [
+        "symbol", "as_of_time", "target_date", "direction",
+        "probability_up", "confidence", "top_factors", "model_version",
+        "feature_snapshot_id", "dataset_version",
+    ]
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in upsert_cols)
+
+    stmt = text(f"""
+        INSERT INTO predictions
+            (prediction_id, {", ".join(upsert_cols)})
+        VALUES
+            (:prediction_id, :{", :".join(upsert_cols)})
+        ON CONFLICT (prediction_id) DO UPDATE SET
+            {set_clause}
+    """)
+
+    batch_size = 200
+    for start in range(0, len(predictions), batch_size):
+        batch = predictions[start : start + batch_size]
+        for pred in batch:
+            params = {"prediction_id": pred["prediction_id"]}
+            for c in upsert_cols:
+                val = pred.get(c)
+                if c == "top_factors" and val is not None:
+                    val = json.dumps(val)
+                params[c] = val
+            db.execute(stmt, params)
+        db.commit()
+
+    return len(predictions)

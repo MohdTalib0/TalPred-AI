@@ -11,7 +11,7 @@ Gates (all mandatory per ENG-SPEC 11):
 
 import hashlib
 import logging
-from datetime import date
+from datetime import UTC, date, datetime
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -39,9 +39,11 @@ BACKTEST_GATES = {
 def generate_model_version(algorithm: str, run_id: str) -> str:
     """Generate a v{major}.{minor}.{patch} model version.
 
-    Patch is derived from a hash of the run_id to ensure uniqueness.
+    Patch is derived from a hash of the run_id.  Using 6 hex chars
+    (16M range) mod 10000 keeps birthday-collision probability < 0.01%
+    at 50 training runs.
     """
-    patch = int(hashlib.sha256(run_id.encode()).hexdigest()[:4], 16) % 1000
+    patch = int(hashlib.sha256(run_id.encode()).hexdigest()[:6], 16) % 10000
     return f"v1.0.{patch}"
 
 
@@ -419,6 +421,8 @@ def promote_model(
                 """), {"mv": model_version})
 
             model.status = target_status
+            if target_status == "production":
+                model.promoted_at = datetime.now(UTC)
             db.commit()
             logger.info(f"Model {model_version} promoted to '{target_status}'")
         else:
@@ -447,7 +451,9 @@ def get_production_model(db: Session) -> ModelRegistry | None:
 def rollback_model(db: Session) -> str | None:
     """Rollback to the previous production model.
 
-    Demotes current production model to 'archived', promotes latest 'archived'.
+    Demotes current production model to 'archived', promotes the most
+    recently *promoted* archived model (by ``promoted_at``).  Falls back
+    to ``created_at`` for models that pre-date the promoted_at column.
     """
     current = get_production_model(db)
     if current:
@@ -459,12 +465,16 @@ def rollback_model(db: Session) -> str | None:
             ModelRegistry.status == "archived",
             ModelRegistry.model_version != (current.model_version if current else ""),
         )
-        .order_by(ModelRegistry.created_at.desc())
+        .order_by(
+            ModelRegistry.promoted_at.desc().nullslast(),
+            ModelRegistry.created_at.desc(),
+        )
         .first()
     )
 
     if previous:
         previous.status = "production"
+        previous.promoted_at = datetime.now(UTC)
         db.commit()
         logger.info(f"Rolled back to model {previous.model_version}")
         return previous.model_version

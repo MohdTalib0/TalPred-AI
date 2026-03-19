@@ -5,7 +5,7 @@ timestamp. This prevents look-ahead bias -- the #1 risk in financial ML.
 """
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -139,7 +139,7 @@ def as_of_join_market(
     """), {
         "symbol": symbol,
         "as_of_date": as_of_date,
-        "start_date": as_of_date - pd.Timedelta(days=lookback_days),
+        "start_date": as_of_date - timedelta(days=lookback_days),
     })
 
     rows = result.fetchall()

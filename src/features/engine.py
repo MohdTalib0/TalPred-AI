@@ -447,6 +447,36 @@ def generate_features(
         all_feat_df["rsi_rank_market"] = all_feat_df.groupby("date")["rsi_14"].rank(pct=True)
         all_feat_df["volume_rank_market"] = all_feat_df.groupby("date")["volume"].rank(pct=True)
         all_feat_df["sector_momentum_rank"] = all_feat_df.groupby(["date", "sector"])["momentum_5d"].rank(pct=True)
+
+        # Idiosyncratic momentum: stock momentum minus SPY momentum (per date)
+        if len(sp500_series) > 0:
+            spy_ret_20d = sp500_series.pct_change(20)
+            spy_ret_60d = sp500_series.pct_change(60)
+            spy_20_map = spy_ret_20d.to_dict()
+            spy_60_map = spy_ret_60d.to_dict()
+            all_feat_df["_spy_mom20"] = all_feat_df["date"].map(spy_20_map)
+            all_feat_df["_spy_mom60"] = all_feat_df["date"].map(spy_60_map)
+            all_feat_df["idio_momentum_20d"] = all_feat_df["momentum_20d"] - all_feat_df["_spy_mom20"]
+            all_feat_df["idio_momentum_60d"] = all_feat_df["momentum_60d"] - all_feat_df["_spy_mom60"]
+            all_feat_df = all_feat_df.drop(columns=["_spy_mom20", "_spy_mom60"])
+
+        # Volume-price divergence: cross-sectional rank difference per date
+        mom_col = "momentum_5d" if "momentum_5d" in all_feat_df.columns else "momentum_20d"
+        if "volume_change_5d" in all_feat_df.columns:
+            all_feat_df["vol_price_divergence"] = (
+                all_feat_df.groupby("date")["volume_change_5d"].rank(pct=True)
+                - all_feat_df.groupby("date")[mom_col].rank(pct=True)
+            )
+
+        # Cross-sectional ranks for alpha features
+        for rank_col, src_col in [
+            ("vol_adj_momentum_20d_rank", "vol_adj_momentum_20d"),
+            ("pct_from_52w_high_rank", "pct_from_52w_high"),
+            ("idio_momentum_20d_rank", "idio_momentum_20d"),
+        ]:
+            if src_col in all_feat_df.columns:
+                all_feat_df[rank_col] = all_feat_df.groupby("date")[src_col].rank(pct=True)
+
         all_feat_df = all_feat_df.sort_values(["symbol", "date"])
     now = datetime.now(UTC)
 
@@ -553,6 +583,15 @@ def generate_features(
                 "volume_imbalance_proxy": _to_float(row.get("volume_imbalance_proxy")),
                 "liquidity_shock_5d": _to_float(row.get("liquidity_shock_5d")),
                 "vwap_deviation": _to_float(row.get("vwap_deviation")),
+                "vol_adj_momentum_20d": _to_float(row.get("vol_adj_momentum_20d")),
+                "vol_adj_momentum_60d": _to_float(row.get("vol_adj_momentum_60d")),
+                "pct_from_52w_high": _to_float(row.get("pct_from_52w_high")),
+                "idio_momentum_20d": _to_float(row.get("idio_momentum_20d")),
+                "idio_momentum_60d": _to_float(row.get("idio_momentum_60d")),
+                "vol_price_divergence": _to_float(row.get("vol_price_divergence")),
+                "vol_adj_momentum_20d_rank": _to_float(row.get("vol_adj_momentum_20d_rank")),
+                "pct_from_52w_high_rank": _to_float(row.get("pct_from_52w_high_rank")),
+                "idio_momentum_20d_rank": _to_float(row.get("idio_momentum_20d_rank")),
                 "benchmark_relative_return_1d": benchmark_rel,
                 "news_sentiment_24h": news_sent_24h,
                 "news_sentiment_7d": _lookup_sentiment(sentiment_df, symbol, td, "sentiment_7d"),
@@ -568,10 +607,13 @@ def generate_features(
                 "dataset_version": dataset_version,
             })
 
-            fund = _merge_fundamental_features_from_db(db, symbol, td)
-            snapshots[-1]["accruals"] = fund["accruals"]
-            snapshots[-1]["roe_trend"] = fund["roe_trend"]
-            snapshots[-1]["earnings_momentum"] = fund["earnings_momentum"]
+            try:
+                fund = _merge_fundamental_features_from_db(db, symbol, td)
+                snapshots[-1]["accruals"] = fund["accruals"]
+                snapshots[-1]["roe_trend"] = fund["roe_trend"]
+                snapshots[-1]["earnings_momentum"] = fund["earnings_momentum"]
+            except Exception:
+                pass
 
     logger.info(f"Generated {len(snapshots)} feature snapshots")
     return snapshots
@@ -611,28 +653,37 @@ def _merge_fundamental_features_from_db(
 
 
 def save_snapshots(db: Session, snapshots: list[dict]) -> int:
-    """Upsert feature snapshots into DB."""
+    """Bulk upsert feature snapshots via INSERT ... ON CONFLICT DO UPDATE."""
     if not snapshots:
         return 0
 
-    from src.models.schema import FeaturesSnapshot
+    sample = snapshots[0]
+    cols = [c for c in sample.keys() if c != "snapshot_id"]
 
-    count = 0
-    for snap in snapshots:
-        existing = db.query(FeaturesSnapshot).filter(
-            FeaturesSnapshot.snapshot_id == snap["snapshot_id"]
-        ).first()
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols)
+    col_names = ", ".join(["snapshot_id"] + cols)
+    placeholders = ", ".join([":snapshot_id"] + [f":{c}" for c in cols])
 
-        if existing:
+    stmt = text(f"""
+        INSERT INTO features_snapshot ({col_names})
+        VALUES ({placeholders})
+        ON CONFLICT (snapshot_id) DO UPDATE SET {set_clause}
+    """)
+
+    batch_size = 200
+    for start in range(0, len(snapshots), batch_size):
+        batch = snapshots[start : start + batch_size]
+        for snap in batch:
+            params = {}
             for k, v in snap.items():
-                setattr(existing, k, v)
-        else:
-            db.add(FeaturesSnapshot(**snap))
-        count += 1
+                if isinstance(v, float) and np.isnan(v):
+                    v = None
+                params[k] = v
+            db.execute(stmt, params)
+        db.commit()
 
-    db.commit()
-    logger.info(f"Saved {count} feature snapshots")
-    return count
+    logger.info(f"Saved {len(snapshots)} feature snapshots")
+    return len(snapshots)
 
 
 def save_sector_returns(db: Session, sector_returns_df: pd.DataFrame) -> int:

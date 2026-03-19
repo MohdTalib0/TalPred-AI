@@ -164,11 +164,16 @@ class RiskManager:
         self, signals: list[Signal], features_df: pd.DataFrame
     ) -> list[Signal]:
         """Trim signals so no sector exceeds max_sector_weight of gross exposure."""
-        sector_map = {}
-        if not features_df.empty and "symbol" in features_df.columns:
-            sector_cols = [c for c in features_df.columns if "sector" in c.lower() and c != "sector_return_1d" and c != "sector_return_5d" and c != "sector_relative_return_1d" and c != "sector_relative_return_5d" and c != "sector_momentum_rank"]
-            if "sector" in features_df.columns:
-                sector_map = features_df.set_index("symbol")["sector"].to_dict()
+        sector_map: dict[str, str] = {}
+        if not features_df.empty and "symbol" in features_df.columns and "sector" in features_df.columns:
+            raw = features_df.set_index("symbol")["sector"].to_dict()
+            sector_map = {k: v for k, v in raw.items() if v is not None}
+            n_missing = len(raw) - len(sector_map)
+            if n_missing > 0:
+                logger.debug(
+                    "Sector cap: %d/%d symbols have NULL sector — excluded from cap",
+                    n_missing, len(raw),
+                )
 
         if not sector_map:
             return signals
@@ -291,8 +296,9 @@ class RiskManager:
         decay = np.exp(-np.log(2) / halflife)
 
         returns = np.array(daily_returns)
-        ewma_var = returns[0] ** 2
-        for r in returns[1:]:
+        warmup = min(5, len(returns))
+        ewma_var = float(np.mean(returns[:warmup] ** 2))
+        for r in returns[warmup:]:
             ewma_var = decay * ewma_var + (1 - decay) * r ** 2
 
         return float(np.sqrt(ewma_var) * np.sqrt(252))
