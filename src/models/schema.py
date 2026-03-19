@@ -157,6 +157,10 @@ class FeaturesSnapshot(Base):
     vix_level = Column(Float)
     sp500_momentum_200d = Column(Float)
 
+    accruals = Column(Float)
+    roe_trend = Column(Float)
+    earnings_momentum = Column(Float)
+
     regime_label = Column(String(30))
     dataset_version = Column(String(64))
 
@@ -217,6 +221,7 @@ class SimulationRun(Base):
     transaction_cost_bps = Column(Float, default=10.0)
     slippage_bps = Column(Float, default=5.0)
     model_version = Column(String(20))
+    strategy_name = Column(String(50))
     status = Column(String(20), default="running")
     result_metrics = Column(JSONB)
 
@@ -234,6 +239,21 @@ class PaperTrade(Base):
     transaction_cost = Column(Float)
     slippage_cost = Column(Float)
     daily_pnl = Column(Float)
+
+
+class FundamentalFeatures(Base):
+    __tablename__ = "fundamental_features"
+
+    symbol = Column(String(20), primary_key=True)
+    as_of_date = Column(Date, primary_key=True)
+    accruals = Column(Float)
+    roe_trend = Column(Float)
+    earnings_momentum = Column(Float)
+    revenue_surprise = Column(Float)
+    gross_margin_change = Column(Float)
+    operating_leverage = Column(Float)
+    source = Column(String(20))
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
 
 class QuarantineRecord(Base):

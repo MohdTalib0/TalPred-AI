@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     finnhub_api_key: str = ""
     openrouter_api_key: str = ""
     openrouter_model_name: str = "meta-llama/llama-3.1-8b-instruct:free"
+    simfin_api_key: str = ""
+    alpha_vantage_api_key: str = ""
 
     mlflow_tracking_uri: str = ""
     mlflow_tracking_username: str = ""

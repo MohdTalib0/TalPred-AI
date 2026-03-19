@@ -211,11 +211,31 @@ def build_training_dataset(
     top_bottom_pct: float = 0.30,
     target_horizon_days: int = 1,
     include_liquidity_features: bool = False,
+    sample_stride: int = 1,
+    include_fundamentals: bool = False,
 ) -> pd.DataFrame:
     """Build a leakage-safe training dataset from features_snapshot.
 
     Each feature row is joined with the NEXT session's actual return as the target.
     This ensures we predict tomorrow using only today's features.
+
+    Args:
+        sample_stride: Keep every Nth row per symbol (chronologically).
+            For a 5-day horizon, stride=5 produces non-overlapping target
+            windows, preventing autocorrelated residuals from inflating
+            effective sample size.  Default 1 = keep all rows.
+        include_fundamentals: If True, fetches fundamental data from
+            SEC EDGAR (free, true PIT dates), yfinance (free fallback),
+            or SimFin (if SIMFIN_API_KEY is set) and merges accruals,
+            ROE trend, and earnings momentum via point-in-time join.
+            No API key required — EDGAR and yfinance are zero-cost.
+
+    Note:
+        When using model_mode="regressor" or "ranker" with fundamental
+        features, you MUST set include_fundamentals=True here (or call
+        merge_fundamental_features() manually after this function).
+        The trainer will raise ValueError if target_value is binary when
+        model_mode expects continuous values.
     """
     if target_horizon_days < 1 or target_horizon_days > 20:
         raise ValueError("target_horizon_days must be between 1 and 20")
@@ -319,20 +339,89 @@ def build_training_dataset(
 
     df = df.dropna(subset=["next_day_return"])
 
+    # Non-overlapping sample filter: for multi-day horizons, consecutive rows
+    # share target windows (e.g., row_t targets days t..t+5, row_{t+1} targets
+    # t+1..t+6 — 4 out of 5 days overlap). Keeping every Nth row eliminates
+    # overlap, giving honest sample counts and uncorrelated residuals.
+    if sample_stride > 1:
+        before = len(df)
+        df = (
+            df.sort_values(["symbol", "target_session_date"])
+            .groupby("symbol", group_keys=False)
+            .apply(lambda g: g.iloc[::sample_stride])
+            .reset_index(drop=True)
+        )
+        logger.info(
+            f"Sample stride={sample_stride}: {before} → {len(df)} rows "
+            f"({len(df)/max(before,1)*100:.0f}% retained, non-overlapping targets)"
+        )
+
     if include_liquidity_features:
-        df["log_market_cap"] = df["market_cap"].apply(lambda x: None if pd.isna(x) else np.log1p(x))
-        df["market_cap_rank"] = df.groupby("target_session_date")["market_cap"].rank(pct=True)
         df["dollar_volume"] = df["close"] * df["volume"]
-        df["turnover_ratio"] = df["volume"] / df["avg_daily_volume_30d"].replace(0, pd.NA)
+
+        # Point-in-time market cap proxy using only historical data.
+        # close * rolling_30d_avg_volume gives trailing dollar volume which is
+        # a cross-sectionally stable size proxy. NEVER fall back to static
+        # symbols.market_cap — that's today's value applied to historical dates.
+        df_sorted = df.sort_values(["symbol", "target_session_date"])
+        rolling_adv_30 = df_sorted.groupby("symbol")["dollar_volume"].transform(
+            lambda x: x.rolling(30, min_periods=5).mean()
+        )
+        df["_pit_market_cap"] = rolling_adv_30.clip(lower=1)
+
+        df["log_market_cap"] = np.log1p(df["_pit_market_cap"])
+        df["market_cap_rank"] = df.groupby("target_session_date")["_pit_market_cap"].rank(pct=True)
+
+        rolling_avg_vol = df_sorted.groupby("symbol")["volume"].transform(
+            lambda x: x.rolling(30, min_periods=5).mean()
+        )
+        df["turnover_ratio"] = df["volume"] / rolling_avg_vol.replace(0, pd.NA)
         df["dollar_volume_rank_market"] = df.groupby("target_session_date")["dollar_volume"].rank(pct=True)
 
-        # Turnover acceleration: deviation from 20-day rolling mean of turnover.
-        # Positive → sudden increase in trading activity vs recent baseline.
         df_sorted = df.sort_values(["symbol", "target_session_date"])
         rolling_turnover = df_sorted.groupby("symbol")["turnover_ratio"].transform(
             lambda x: x.rolling(20, min_periods=5).mean()
         )
         df["turnover_acceleration"] = df_sorted["turnover_ratio"] - rolling_turnover
+
+        df = df.drop(columns=["_pit_market_cap"], errors="ignore")
+
+    # ── Cross-sectional alpha features (computed from existing columns) ──
+    # These vary across stocks on the same day — critical for market-relative models.
+
+    vol_20 = df["rolling_volatility_20d"].clip(lower=0.001)
+    df["vol_adj_momentum_20d"] = df["momentum_20d"] / vol_20
+    df["vol_adj_momentum_60d"] = df["momentum_60d"] / vol_20
+
+    df_sorted = df.sort_values(["symbol", "target_session_date"])
+    df["high_52w"] = df_sorted.groupby("symbol")["close"].transform(
+        lambda x: x.rolling(252, min_periods=60).max()
+    )
+    df["pct_from_52w_high"] = df["close"] / df["high_52w"].clip(lower=0.01)
+    df = df.drop(columns=["high_52w"])
+
+    spy_mom = (
+        df[df["symbol"] == "SPY"][["target_session_date", "momentum_20d", "momentum_60d"]]
+        .drop_duplicates("target_session_date")
+        .rename(columns={"momentum_20d": "_spy_mom20", "momentum_60d": "_spy_mom60"})
+    )
+    df = df.merge(
+        spy_mom[["target_session_date", "_spy_mom20", "_spy_mom60"]],
+        on="target_session_date", how="left",
+    )
+    df["idio_momentum_20d"] = df["momentum_20d"] - df["_spy_mom20"].fillna(0)
+    df["idio_momentum_60d"] = df["momentum_60d"] - df["_spy_mom60"].fillna(0)
+    df = df.drop(columns=["_spy_mom20", "_spy_mom60"], errors="ignore")
+
+    if "volume_change_5d" in df.columns and "momentum_5d" in df.columns:
+        df["vol_price_divergence"] = (
+            df.groupby("target_session_date")["volume_change_5d"].rank(pct=True)
+            - df.groupby("target_session_date")["momentum_5d"].rank(pct=True)
+        )
+
+    for col in ["vol_adj_momentum_20d", "pct_from_52w_high", "idio_momentum_20d"]:
+        if col in df.columns:
+            df[f"{col}_rank"] = df.groupby("target_session_date")[col].rank(pct=True)
 
     if target_mode == "absolute":
         df["target_value"] = df["next_day_return"]
@@ -416,11 +505,30 @@ def build_training_dataset(
 
     df = df.drop(columns=[c for c in ["market_cap", "avg_daily_volume_30d", "close", "volume"] if c in df.columns])
 
+    # Optionally merge fundamental features (SUE, accruals, margins, etc.)
+    if include_fundamentals:
+        try:
+            from src.features.fundamentals import (
+                load_fundamentals,
+                compute_fundamental_features,
+                merge_fundamental_features,
+            )
+            fund_data = load_fundamentals(symbols, start_date, end_date)
+            fund_features = compute_fundamental_features(fund_data)
+            if not fund_features.empty:
+                df = merge_fundamental_features(df, fund_features)
+                logger.info("Fundamental features merged into training dataset")
+            else:
+                logger.warning("No fundamental features computed — continuing without")
+        except Exception as e:
+            logger.warning(f"Fundamental feature merge failed: {e} — continuing without")
+
     logger.info(
         f"Training dataset: {len(df)} rows, "
         f"{df['symbol'].nunique()} symbols, "
         f"{df['target_session_date'].min()} to {df['target_session_date'].max()} "
-        f"(target_mode={target_mode}, horizon={target_horizon_days}, liquidity={include_liquidity_features})"
+        f"(target_mode={target_mode}, horizon={target_horizon_days}, "
+        f"liquidity={include_liquidity_features}, fundamentals={include_fundamentals})"
     )
     return df
 

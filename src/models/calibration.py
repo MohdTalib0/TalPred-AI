@@ -46,8 +46,13 @@ def calibrate_model(
     X_fit, y_fit, medians = prepare_features(df_fit, fill_medians=train_medians, feature_profile=feature_profile)
     X_eval, y_eval, _ = prepare_features(df_eval, fill_medians=medians, feature_profile=feature_profile)
 
-    common_cols = [c for c in X_fit.columns if c in X_eval.columns]
-    X_fit, X_eval = X_fit[common_cols], X_eval[common_cols]
+    model_features = model.get_booster().feature_names
+    for feat_set in (X_fit, X_eval):
+        for col in model_features:
+            if col not in feat_set.columns:
+                feat_set[col] = 0
+    X_fit = X_fit[model_features]
+    X_eval = X_eval[model_features]
 
     raw_probs = model.predict_proba(X_eval)[:, 1]
     raw_brier = brier_score_loss(y_eval, raw_probs)

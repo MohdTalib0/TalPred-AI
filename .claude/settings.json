@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find 'c:\\\\Users\\\\moham\\\\Downloads\\\\Project-TalPred AI' -name .env.example -o -name *.env*)",
+      "Bash(grep -n \"factor_constraint_enabled\\\\|set_factor_model\" src/strategies/*.py)"
+    ]
+  }
+}

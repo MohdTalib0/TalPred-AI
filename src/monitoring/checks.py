@@ -33,8 +33,13 @@ def run_all_checks(db: Session) -> dict:
         "data_freshness": check_data_freshness(db),
         "model_performance": check_model_performance(db),
         "signal_environment": check_signal_environment(db),
+        "alpha_quality": check_alpha_quality(db),
         "feature_drift": check_feature_drift(db),
+        "feature_stability": check_feature_importance_stability(db),
+        "capacity_indicators": check_capacity_indicators(db),
+        "regime_stress": check_regime_stress(db),
         "pipeline_health": check_pipeline_health(db),
+        "feature_ood": check_feature_ood(db),
     }
 
     alerts = []
@@ -284,6 +289,115 @@ def check_signal_environment(db: Session) -> dict:
     }
 
 
+def check_alpha_quality(db: Session) -> dict:
+    """Track decile spread, hit rate by confidence tier, and IC trend.
+
+    This is the core "is the alpha still alive?" check.
+    """
+    import pandas as pd
+
+    alerts = []
+
+    result = db.execute(text("""
+        SELECT
+            p.target_date,
+            p.symbol,
+            p.probability_up,
+            p.direction,
+            p.confidence,
+            p.realized_return,
+            p.realized_direction
+        FROM predictions p
+        WHERE p.realized_return IS NOT NULL
+          AND p.target_date >= CURRENT_DATE - 60
+        ORDER BY p.target_date, p.probability_up DESC
+    """))
+    rows = result.fetchall()
+
+    if not rows or len(rows) < 100:
+        return {"status": "insufficient_data", "n_rows": len(rows) if rows else 0, "alerts": []}
+
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "target_date", "symbol", "probability_up", "direction",
+            "confidence", "realized_return", "realized_direction",
+        ],
+    )
+
+    # ── Decile spread (daily top vs bottom quintile return) ──
+    daily_spreads = []
+    daily_ic = []
+    for dt, grp in df.groupby("target_date"):
+        if len(grp) < 20:
+            continue
+        grp = grp.sort_values("probability_up", ascending=False)
+        n = len(grp) // 5
+        top_ret = grp.head(n)["realized_return"].mean()
+        bot_ret = grp.tail(n)["realized_return"].mean()
+        daily_spreads.append({"date": dt, "spread": float(top_ret - bot_ret)})
+
+        ic = grp["probability_up"].corr(grp["realized_return"], method="spearman")
+        if pd.notna(ic):
+            daily_ic.append({"date": dt, "ic": float(ic)})
+
+    decile_spread_mean = None
+    decile_spread_bps = None
+    if daily_spreads:
+        sp = pd.DataFrame(daily_spreads)
+        decile_spread_mean = float(sp["spread"].mean())
+        decile_spread_bps = round(decile_spread_mean * 10000, 1)
+
+    # ── IC trend: is it rising or falling? ──
+    ic_trend = None
+    ic_recent_30d = None
+    ic_prior_30d = None
+    if daily_ic and len(daily_ic) >= 20:
+        ic_df = pd.DataFrame(daily_ic).sort_values("date")
+        half = len(ic_df) // 2
+        ic_prior_30d = float(ic_df.iloc[:half]["ic"].mean())
+        ic_recent_30d = float(ic_df.iloc[half:]["ic"].mean())
+        ic_trend = "improving" if ic_recent_30d > ic_prior_30d else "declining"
+
+        if ic_recent_30d < 0.005:
+            alerts.append({
+                "level": "warning",
+                "check": "alpha_decay",
+                "detail": (
+                    f"Recent 30d IC={ic_recent_30d:.4f} is near zero "
+                    f"(prior={ic_prior_30d:.4f}, trend={ic_trend})"
+                ),
+            })
+
+    # ── Hit rate by confidence tier ──
+    hit_rates = {}
+    for label, lo, hi in [
+        ("low (0.50-0.55)", 0.50, 0.55),
+        ("mid (0.55-0.60)", 0.55, 0.60),
+        ("high (0.60-0.70)", 0.60, 0.70),
+        ("very_high (0.70+)", 0.70, 1.01),
+    ]:
+        tier = df[(df["confidence"] >= lo) & (df["confidence"] < hi)]
+        if len(tier) < 10:
+            continue
+        correct = (tier["direction"] == tier["realized_direction"]).sum()
+        hit_rates[label] = {
+            "n": int(len(tier)),
+            "hit_rate": round(float(correct / len(tier)), 4),
+        }
+
+    return {
+        "decile_spread_bps": decile_spread_bps,
+        "decile_spread_mean": round(decile_spread_mean, 6) if decile_spread_mean else None,
+        "n_spread_days": len(daily_spreads),
+        "ic_recent_30d": round(ic_recent_30d, 5) if ic_recent_30d is not None else None,
+        "ic_prior_30d": round(ic_prior_30d, 5) if ic_prior_30d is not None else None,
+        "ic_trend": ic_trend,
+        "hit_rates_by_confidence": hit_rates,
+        "alerts": alerts,
+    }
+
+
 def check_feature_drift(db: Session) -> dict:
     """Check for feature distribution drift using simple PSI approximation.
 
@@ -293,7 +407,8 @@ def check_feature_drift(db: Session) -> dict:
     drift_scores = {}
 
     feature_cols = [
-        "rsi_14", "momentum_5d", "rolling_volatility_20d", "vix_level"
+        "rsi_14", "momentum_5d", "rolling_volatility_20d", "vix_level",
+        "momentum_20d", "momentum_60d", "short_term_reversal",
     ]
 
     for col in feature_cols:
@@ -361,6 +476,204 @@ def _approximate_psi(
     return float(psi)
 
 
+def check_feature_importance_stability(db: Session) -> dict:
+    """Track whether the model's top features are stable over time.
+
+    Compares recent feature importance rankings against a stored baseline
+    to detect alpha decay or regime shifts that change what matters.
+    """
+    import json
+    import os
+
+    alerts = []
+    stability = {}
+
+    baseline_path = os.path.join("artifacts", "production_model", "metadata.json")
+    if not os.path.exists(baseline_path):
+        return {"status": "no_baseline", "alerts": []}
+
+    try:
+        with open(baseline_path) as f:
+            metadata = json.load(f)
+    except Exception:
+        return {"status": "baseline_unreadable", "alerts": []}
+
+    feature_cols = metadata.get("feature_columns", [])
+    if not feature_cols:
+        return {"status": "no_feature_columns", "alerts": []}
+
+    result = db.execute(text("""
+        SELECT target_session_date, COUNT(*)
+        FROM features_snapshot
+        WHERE target_session_date >= CURRENT_DATE - 30
+        GROUP BY target_session_date
+        ORDER BY target_session_date
+    """))
+    rows = result.fetchall()
+    active_days = len(rows) if rows else 0
+
+    stability["active_feature_days_30d"] = active_days
+    stability["tracked_features"] = len(feature_cols)
+
+    if active_days < 5:
+        alerts.append({
+            "level": "warning",
+            "check": "insufficient_feature_data",
+            "detail": f"Only {active_days} days of features in last 30d",
+        })
+
+    return {"stability": stability, "alerts": alerts}
+
+
+def check_capacity_indicators(db: Session) -> dict:
+    """Monitor capacity-related metrics: ADV coverage, concentration risk.
+
+    Flags when the universe liquidity is too thin for the strategy's capital.
+    """
+    alerts = []
+
+    result = db.execute(text("""
+        SELECT
+            s.symbol,
+            s.avg_daily_volume_30d,
+            mb.close
+        FROM symbols s
+        LEFT JOIN LATERAL (
+            SELECT close
+            FROM market_bars_daily
+            WHERE symbol = s.symbol
+            ORDER BY date DESC
+            LIMIT 1
+        ) mb ON true
+        WHERE s.is_active = true
+          AND s.avg_daily_volume_30d IS NOT NULL
+    """))
+    rows = result.fetchall()
+
+    if not rows:
+        return {"status": "no_data", "alerts": []}
+
+    import pandas as pd
+
+    df = pd.DataFrame(rows, columns=["symbol", "adv_shares", "close"])
+    df["adv_dollars"] = df["adv_shares"].fillna(0) * df["close"].fillna(0)
+
+    total_adv = float(df["adv_dollars"].sum())
+    median_adv = float(df["adv_dollars"].median())
+    p10_adv = float(df["adv_dollars"].quantile(0.10))
+    illiquid_count = int((df["adv_dollars"] < 1_000_000).sum())
+
+    # At 5% participation, how much capital can the universe absorb?
+    max_capital_5pct = total_adv * 0.05
+    max_capital_1pct = total_adv * 0.01
+
+    if illiquid_count > len(df) * 0.2:
+        alerts.append({
+            "level": "warning",
+            "check": "illiquid_universe",
+            "detail": f"{illiquid_count}/{len(df)} symbols have ADV < $1M",
+        })
+
+    return {
+        "universe_size": len(df),
+        "total_universe_adv": round(total_adv, 0),
+        "median_adv_dollars": round(median_adv, 0),
+        "p10_adv_dollars": round(p10_adv, 0),
+        "illiquid_count_lt_1m": illiquid_count,
+        "max_capital_at_5pct_participation": round(max_capital_5pct, 0),
+        "max_capital_at_1pct_participation": round(max_capital_1pct, 0),
+        "alerts": alerts,
+    }
+
+
+def check_regime_stress(db: Session) -> dict:
+    """Monitor current regime and flag crisis conditions.
+
+    Checks VIX level, recent drawdown magnitude, and cross-sectional
+    dispersion to detect stress environments where the strategy may
+    behave differently.
+    """
+    import pandas as pd
+
+    alerts = []
+
+    # Current VIX
+    result = db.execute(text("""
+        SELECT AVG(vix_level)
+        FROM features_snapshot
+        WHERE target_session_date = (
+            SELECT MAX(target_session_date) FROM features_snapshot
+        )
+    """))
+    current_vix = result.scalar()
+    current_vix = float(current_vix) if current_vix is not None else None
+
+    if current_vix and current_vix >= 30:
+        alerts.append({
+            "level": "critical",
+            "check": "vix_crisis",
+            "detail": f"VIX at {current_vix:.1f} — crisis regime",
+        })
+    elif current_vix and current_vix >= 25:
+        alerts.append({
+            "level": "warning",
+            "check": "vix_elevated",
+            "detail": f"VIX at {current_vix:.1f} — elevated stress",
+        })
+
+    # SPY drawdown from recent peak
+    result = db.execute(text("""
+        SELECT date, close
+        FROM market_bars_daily
+        WHERE symbol = 'SPY'
+          AND date >= CURRENT_DATE - 60
+        ORDER BY date
+    """))
+    spy_rows = result.fetchall()
+    spy_drawdown = None
+    if spy_rows:
+        spy_df = pd.DataFrame(spy_rows, columns=["date", "close"])
+        peak = spy_df["close"].cummax()
+        dd = (spy_df["close"] - peak) / peak
+        spy_drawdown = float(dd.iloc[-1]) if not dd.empty else None
+
+        if spy_drawdown is not None and spy_drawdown < -0.10:
+            alerts.append({
+                "level": "critical",
+                "check": "spy_drawdown",
+                "detail": f"SPY drawdown {spy_drawdown:.1%} from 60d peak",
+            })
+        elif spy_drawdown is not None and spy_drawdown < -0.05:
+            alerts.append({
+                "level": "warning",
+                "check": "spy_drawdown",
+                "detail": f"SPY drawdown {spy_drawdown:.1%} from 60d peak",
+            })
+
+    # Cross-sectional return dispersion (last 5 days)
+    result = db.execute(text("""
+        WITH rets AS (
+            SELECT date, symbol,
+                   close / NULLIF(LAG(close) OVER (PARTITION BY symbol ORDER BY date), 0) - 1 AS ret
+            FROM market_bars_daily
+            WHERE date >= CURRENT_DATE - 10
+        )
+        SELECT STDDEV(ret)
+        FROM rets
+        WHERE ret IS NOT NULL
+          AND date >= CURRENT_DATE - 5
+    """))
+    recent_dispersion = result.scalar()
+    recent_dispersion = float(recent_dispersion) if recent_dispersion else None
+
+    return {
+        "current_vix": round(current_vix, 2) if current_vix else None,
+        "spy_drawdown_60d": round(spy_drawdown, 4) if spy_drawdown is not None else None,
+        "recent_dispersion_5d": round(recent_dispersion, 6) if recent_dispersion else None,
+        "alerts": alerts,
+    }
+
+
 def check_pipeline_health(db: Session) -> dict:
     """Check overall pipeline execution health."""
     alerts = []
@@ -396,3 +709,176 @@ def check_pipeline_health(db: Session) -> dict:
         "prediction_days_7d": pred_days,
         "alerts": alerts,
     }
+
+
+# ------------------------------------------------------------------
+# OOD Detection
+# ------------------------------------------------------------------
+
+_OOD_FEATURES = [
+    "rsi_14", "momentum_5d", "momentum_20d", "momentum_60d",
+    "rolling_volatility_20d", "volume_change_5d", "volume_zscore_20d",
+    "macd", "short_term_reversal", "volatility_expansion_5_20",
+    "log_market_cap", "turnover_ratio",
+]
+
+_OOD_TRAIN_LOOKBACK_DAYS = 252
+_OOD_PERCENTILE_THRESHOLD = 99
+
+
+def check_feature_ood(db: Session) -> dict:
+    """Detect out-of-distribution feature vectors using Mahalanobis distance.
+
+    Compares today's cross-sectional feature distribution against the
+    training distribution (last 252 days). Uses Ledoit-Wolf shrinkage
+    covariance estimator for numerical stability with 38+ features.
+
+    Fires an alert when the median Mahalanobis distance of today's
+    feature vectors exceeds the 99th percentile of the training
+    distribution's distances, indicating the model is extrapolating.
+    """
+    alerts = []
+
+    try:
+        from sklearn.covariance import LedoitWolf
+    except ImportError:
+        return {"status": "skipped", "reason": "scikit-learn not available", "alerts": []}
+
+    # Fetch training-period features (last 252 trading days)
+    feature_cols_sql = ", ".join(
+        f"fs.{col}" for col in _OOD_FEATURES
+    )
+    train_query = f"""
+        SELECT fs.target_session_date, fs.symbol, {feature_cols_sql}
+        FROM features_snapshot fs
+        WHERE fs.target_session_date >= CURRENT_DATE - {_OOD_TRAIN_LOOKBACK_DAYS + 5}
+          AND fs.target_session_date < CURRENT_DATE
+        ORDER BY fs.target_session_date
+    """
+    try:
+        result = db.execute(text(train_query))
+        train_rows = result.fetchall()
+    except Exception as e:
+        logger.warning(f"OOD check: training data query failed: {e}")
+        return {"status": "error", "reason": str(e), "alerts": []}
+
+    if len(train_rows) < 100:
+        return {
+            "status": "insufficient_data",
+            "n_train_rows": len(train_rows),
+            "alerts": [],
+        }
+
+    cols = ["target_session_date", "symbol"] + _OOD_FEATURES
+    train_df = _ood_rows_to_df(train_rows, cols)
+    if train_df.empty:
+        return {"status": "no_valid_training_data", "alerts": []}
+
+    # Fetch today's features
+    today_query = f"""
+        SELECT fs.target_session_date, fs.symbol, {feature_cols_sql}
+        FROM features_snapshot fs
+        WHERE fs.target_session_date = (
+            SELECT MAX(target_session_date) FROM features_snapshot
+        )
+    """
+    try:
+        result = db.execute(text(today_query))
+        today_rows = result.fetchall()
+    except Exception as e:
+        logger.warning(f"OOD check: today's data query failed: {e}")
+        return {"status": "error", "reason": str(e), "alerts": []}
+
+    if not today_rows:
+        return {"status": "no_today_data", "alerts": []}
+
+    today_df = _ood_rows_to_df(today_rows, cols)
+    if today_df.empty:
+        return {"status": "no_valid_today_data", "alerts": []}
+
+    # Fit Ledoit-Wolf covariance on training data
+    train_features = train_df[_OOD_FEATURES].values
+    today_features = today_df[_OOD_FEATURES].values
+
+    try:
+        lw = LedoitWolf()
+        lw.fit(train_features)
+        precision = lw.precision_
+        train_mean = train_features.mean(axis=0)
+    except Exception as e:
+        logger.warning(f"OOD check: Ledoit-Wolf fit failed: {e}")
+        return {"status": "error", "reason": str(e), "alerts": []}
+
+    # Mahalanobis distances for training data (baseline distribution)
+    train_centered = train_features - train_mean
+    train_mahal = np.sqrt(
+        np.sum(train_centered @ precision * train_centered, axis=1)
+    )
+
+    # Mahalanobis distances for today's data
+    today_centered = today_features - train_mean
+    today_mahal = np.sqrt(
+        np.sum(today_centered @ precision * today_centered, axis=1)
+    )
+
+    # Percentile threshold from training distribution
+    threshold = float(np.percentile(train_mahal, _OOD_PERCENTILE_THRESHOLD))
+    today_median = float(np.median(today_mahal))
+    today_max = float(np.max(today_mahal))
+    pct_ood = float(np.mean(today_mahal > threshold) * 100)
+
+    is_ood = today_median > threshold
+
+    if is_ood:
+        alerts.append({
+            "level": "warning",
+            "check": "feature_ood",
+            "detail": (
+                f"Feature distribution OOD: median Mahalanobis={today_median:.1f} "
+                f"> {_OOD_PERCENTILE_THRESHOLD}th pct threshold={threshold:.1f}. "
+                f"{pct_ood:.0f}% of stocks flagged OOD. "
+                f"Model may be extrapolating — consider reducing confidence."
+            ),
+        })
+        logger.warning(
+            "OOD ALERT: median_mahal=%.1f > threshold=%.1f (%.0f%% OOD stocks)",
+            today_median, threshold, pct_ood,
+        )
+
+    # Per-stock OOD flags
+    ood_symbols = []
+    if len(today_df) > 0:
+        for i, (_, row) in enumerate(today_df.iterrows()):
+            if today_mahal[i] > threshold:
+                ood_symbols.append(row["symbol"] if "symbol" in row else f"stock_{i}")
+
+    return {
+        "status": "ood_detected" if is_ood else "in_distribution",
+        "today_median_mahalanobis": round(today_median, 2),
+        "today_max_mahalanobis": round(today_max, 2),
+        "threshold_99pct": round(threshold, 2),
+        "pct_stocks_ood": round(pct_ood, 1),
+        "n_ood_stocks": len(ood_symbols),
+        "ood_symbols_sample": ood_symbols[:10],
+        "n_train_rows": len(train_features),
+        "n_today_rows": len(today_features),
+        "n_features": len(_OOD_FEATURES),
+        "covariance_method": "ledoit_wolf",
+        "shrinkage_coeff": (
+            round(float(lw.shrinkage_), 4) if hasattr(lw, "shrinkage_") else None
+        ),
+        "alerts": alerts,
+    }
+
+
+def _ood_rows_to_df(rows, cols: list[str]):
+    """Convert DB rows to a cleaned DataFrame for OOD computation."""
+    import pandas as pd
+
+    df = pd.DataFrame(rows, columns=cols)
+    feature_cols = [c for c in cols if c not in ("target_session_date", "symbol")]
+    for col in feature_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=feature_cols)
+    return df

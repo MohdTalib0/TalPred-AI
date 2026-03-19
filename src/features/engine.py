@@ -184,6 +184,59 @@ def load_sector_map(db: Session) -> dict[str, str]:
     return {row[0]: row[1] for row in result.fetchall()}
 
 
+def load_pit_universe(db: Session, as_of_date: date) -> list[str]:
+    """Point-in-time universe: symbols that were active on a given date.
+
+    Uses effective_from / effective_to to reconstruct the historical
+    universe, avoiding survivorship bias. Symbols with effective_to IS NULL
+    are assumed to be currently active.  Only returns symbols that had
+    market data around the as_of_date.
+    """
+    result = db.execute(
+        text("""
+            SELECT DISTINCT s.symbol
+            FROM symbols s
+            WHERE s.effective_from <= :d
+              AND (s.effective_to IS NULL OR s.effective_to >= :d)
+              AND EXISTS (
+                  SELECT 1 FROM market_bars_daily mb
+                  WHERE mb.symbol = s.symbol
+                    AND mb.date BETWEEN (:d::date - INTERVAL '10 days') AND (:d::date + INTERVAL '10 days')
+              )
+        """),
+        {"d": as_of_date},
+    )
+    return [row[0] for row in result.fetchall()]
+
+
+def load_training_universe(
+    db: Session,
+    start_date: date,
+    end_date: date,
+) -> list[str]:
+    """Union of all symbols that were active at any point during [start, end].
+
+    This captures delisted stocks that existed during the training period,
+    mitigating survivorship bias vs. the simpler approach of only using
+    today's active symbols.
+    """
+    result = db.execute(
+        text("""
+            SELECT DISTINCT s.symbol
+            FROM symbols s
+            WHERE s.effective_from <= :end
+              AND (s.effective_to IS NULL OR s.effective_to >= :start)
+              AND EXISTS (
+                  SELECT 1 FROM market_bars_daily mb
+                  WHERE mb.symbol = s.symbol
+                    AND mb.date BETWEEN :start AND :end
+              )
+        """),
+        {"start": start_date, "end": end_date},
+    )
+    return [row[0] for row in result.fetchall()]
+
+
 def load_macro_latest(db: Session) -> dict:
     """Load latest VIX value."""
     result = db.execute(text("""
@@ -288,11 +341,18 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df["liquidity_shock_5d"] = df["volume_zscore_20d"].abs().rolling(5, min_periods=2).max().clip(0, 15)
 
     # VWAP deviation: how far did the close land from the day's typical price.
-    # Typical price ≈ (high + low + close) / 3
-    # Positive → closed near the high (buying pressure dominated the session).
-    # Negative → closed near the low (selling pressure dominated).
     typical_price = (df["high"] + df["low"] + close) / 3
     df["vwap_deviation"] = ((close - typical_price) / typical_price.where(lambda x: x > 1e-6, np.nan)).clip(-0.5, 0.5)
+
+    # --- Cross-sectional alpha features ---
+
+    vol_20 = df["rolling_volatility_20d"].clip(lower=0.001)
+    df["vol_adj_momentum_20d"] = df["momentum_20d"] / vol_20
+    df["vol_adj_momentum_60d"] = df["momentum_60d"] / vol_20
+
+    df["high_52w"] = close.rolling(252, min_periods=60).max()
+    df["pct_from_52w_high"] = close / df["high_52w"].clip(lower=0.01)
+    df = df.drop(columns=["high_52w"])
 
     return df
 
@@ -508,8 +568,46 @@ def generate_features(
                 "dataset_version": dataset_version,
             })
 
+            fund = _merge_fundamental_features_from_db(db, symbol, td)
+            snapshots[-1]["accruals"] = fund["accruals"]
+            snapshots[-1]["roe_trend"] = fund["roe_trend"]
+            snapshots[-1]["earnings_momentum"] = fund["earnings_momentum"]
+
     logger.info(f"Generated {len(snapshots)} feature snapshots")
     return snapshots
+
+
+def _merge_fundamental_features_from_db(
+    db: Session, symbol: str, as_of_date: date,
+) -> dict:
+    """PIT lookup of pre-computed fundamental features from DB.
+
+    Returns the most recent fundamental_features row where
+    as_of_date <= target date. Returns empty dict values if no data.
+    """
+    from src.models.schema import FundamentalFeatures
+
+    try:
+        row = (
+            db.query(FundamentalFeatures)
+            .filter(
+                FundamentalFeatures.symbol == symbol,
+                FundamentalFeatures.as_of_date <= as_of_date,
+            )
+            .order_by(FundamentalFeatures.as_of_date.desc())
+            .first()
+        )
+    except Exception:
+        return {"accruals": None, "roe_trend": None, "earnings_momentum": None}
+
+    if row is None:
+        return {"accruals": None, "roe_trend": None, "earnings_momentum": None}
+
+    return {
+        "accruals": row.accruals,
+        "roe_trend": row.roe_trend,
+        "earnings_momentum": row.earnings_momentum,
+    }
 
 
 def save_snapshots(db: Session, snapshots: list[dict]) -> int:

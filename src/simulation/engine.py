@@ -1,8 +1,14 @@
 """Paper trading simulation engine (BE-401).
 
-Confidence-weighted allocation with position caps per ENG-SPEC 13.
+Supports two modes:
+  1. **Legacy** (backward-compatible): confidence-weighted allocation with
+     position caps, VIX/IC exposure guards.
+  2. **Strategy framework**: pluggable portfolio construction modes
+     (momentum, sector-rotation, mean-reversion) with shared risk
+     management, realistic cost modeling, benchmark tracking, and
+     multi-day hold support.
 
-Portfolio policy:
+Portfolio policy defaults (legacy mode):
   weight_i = confidence_i / sum(confidence_j)
   max_position = 5%
   min_confidence_trade = 0.60
@@ -19,8 +25,296 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.models.schema import PaperTrade, SimulationRun
+from src.strategies.base import BaseStrategy
+from src.strategies.config import StrategyFrameworkConfig
+from src.strategies.portfolio import PortfolioConstructor
+from src.strategies.risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
+
+
+def _try_build_factor_model(db: Session, end_date: date):
+    """Attempt to build and fit a StatisticalFactorModel.
+
+    Returns the fitted model or None if data is insufficient.
+    """
+    try:
+        from src.models.factor_model import StatisticalFactorModel, build_return_matrix
+        from datetime import timedelta
+
+        start = end_date - timedelta(days=400)
+        symbols_result = db.execute(text(
+            "SELECT DISTINCT symbol FROM market_bars_daily "
+            "WHERE date >= :s AND date <= :e",
+        ), {"s": start, "e": end_date})
+        symbols = [r[0] for r in symbols_result.fetchall()]
+        if len(symbols) < 40:
+            logger.info("Factor model skipped: only %d symbols (need 40+)", len(symbols))
+            return None
+
+        returns = build_return_matrix(db, symbols, start, end_date)
+        if returns.empty or len(returns) < 60:
+            logger.info("Factor model skipped: insufficient return history")
+            return None
+
+        fm = StatisticalFactorModel(n_factors=30, lookback=252)
+        fm.fit(returns, as_of_date=end_date)
+        return fm
+    except Exception as e:
+        logger.warning("Factor model build failed: %s", e)
+        return None
+
+
+# -----------------------------------------------------------------------
+# Strategy-framework entry point
+# -----------------------------------------------------------------------
+
+
+def run_strategy_simulation(
+    db: Session,
+    strategy: BaseStrategy,
+    start_date: date,
+    end_date: date,
+    config: StrategyFrameworkConfig | None = None,
+    model_version: str | None = None,
+) -> dict:
+    """Execute a paper-trading simulation using the strategy framework.
+
+    Models true multi-day holds: positions are opened on rebalance days
+    and held until the next rebalance.  Transaction costs are only charged
+    on turnover (the delta between old and new weights), not every day.
+
+    P&L on hold days = close-to-close return of existing positions.
+    P&L on rebalance days = close-to-close return minus rebalance costs.
+    """
+    cfg = config or StrategyFrameworkConfig()
+    run_id = uuid.uuid4().hex[:16]
+    risk_mgr = RiskManager(cfg.risk)
+
+    if cfg.risk.factor_constraint_enabled:
+        factor_model = _try_build_factor_model(db, end_date)
+        if factor_model is not None:
+            risk_mgr.set_factor_model(factor_model)
+            logger.info("Factor model attached to RiskManager")
+
+    portfolio = PortfolioConstructor(
+        cfg.cost, beta_neutral=cfg.beta_neutral,
+        turnover_penalty=cfg.turnover_penalty,
+    )
+
+    sim_run = SimulationRun(
+        run_id=run_id,
+        start_date=start_date,
+        end_date=end_date,
+        starting_capital=cfg.starting_capital,
+        min_confidence_trade=getattr(
+            getattr(cfg, strategy.name, cfg.momentum), "min_confidence", 0.60
+        ),
+        max_position=cfg.risk.max_position_weight,
+        transaction_cost_bps=cfg.cost.base_cost_bps,
+        slippage_bps=cfg.cost.slippage_floor_bps,
+        model_version=model_version,
+        strategy_name=strategy.name,
+        status="running",
+    )
+    db.add(sim_run)
+    db.commit()
+
+    predictions_df = _load_predictions(db, start_date, end_date, model_version)
+    if predictions_df.empty:
+        sim_run.status = "failed"
+        sim_run.result_metrics = {"error": "No predictions found"}
+        db.commit()
+        return {"run_id": run_id, "error": "No predictions found"}
+
+    features_df = _load_features(db, start_date, end_date)
+    prices_df = _load_prices(db, start_date, end_date)
+    market_df = _load_market_window(db, end_date, lookback=60)
+
+    if prices_df.empty:
+        sim_run.status = "failed"
+        sim_run.result_metrics = {"error": "No price data found"}
+        db.commit()
+        return {"run_id": run_id, "error": "No price data found"}
+
+    trading_dates = sorted(predictions_df["target_date"].unique())
+    rebalance_dates = set(trading_dates[:: cfg.rebalance.stride_days])
+
+    logger.info(
+        "Simulation %s [%s]: %d trading days, %d rebalance days, capital=$%,.0f",
+        run_id,
+        strategy.name,
+        len(trading_dates),
+        len(rebalance_dates),
+        cfg.starting_capital,
+    )
+
+    equity = cfg.starting_capital
+    equity_curve = [{"date": str(start_date), "equity": equity}]
+    all_trades: list[dict] = []
+    daily_returns: list[float] = []
+    benchmark_returns: list[float] = []
+
+    # Multi-day hold state: symbol → signed weight (positive=long, negative=short)
+    current_weights: dict[str, float] = {}
+    prev_closes: dict[str, float] = {}
+
+    for td in trading_dates:
+        day_preds = predictions_df[predictions_df["target_date"] == td].copy()
+        day_features = (
+            features_df[features_df["target_session_date"] == td]
+            if "target_session_date" in features_df.columns
+            else features_df
+        )
+
+        is_rebalance = td in rebalance_dates
+
+        # ── Close-to-close P&L for existing positions ──
+        hold_pnl = 0.0
+        for symbol, weight in current_weights.items():
+            price_row = prices_df[
+                (prices_df["symbol"] == symbol) & (prices_df["date"] == td)
+            ]
+            if price_row.empty:
+                continue
+            today_close = float(price_row.iloc[0]["close"])
+            yesterday_close = prev_closes.get(symbol)
+            if yesterday_close and yesterday_close > 0:
+                ret = (today_close - yesterday_close) / yesterday_close
+                hold_pnl += weight * equity * ret
+
+        # ── Rebalance: compute new weights and turnover cost ──
+        rebalance_cost = 0.0
+        if is_rebalance:
+            vix = _get_vix(day_features)
+            signals = strategy.generate_signals(
+                day_preds, day_features, market_df, td
+            )
+            signals = risk_mgr.apply(
+                signals, day_features, market_df, equity, daily_returns, vix=vix
+            )
+
+            new_weights = portfolio.compute_target_weights(
+                signals, market_df, prices_df, td,
+                current_weights=current_weights,
+            )
+
+            adv_lookup = portfolio._adv_lookup(market_df)
+
+            # Clip positions that would exceed ADV participation limits
+            new_weights = portfolio.apply_partial_fills(
+                new_weights, equity, adv_lookup
+            )
+
+            turnover = _compute_turnover(current_weights, new_weights)
+            rebalance_cost = portfolio.compute_rebalance_cost(
+                current_weights, new_weights, equity, adv_lookup
+            )
+
+            # Record trades for positions that changed
+            for symbol in set(list(current_weights.keys()) + list(new_weights.keys())):
+                old_w = current_weights.get(symbol, 0.0)
+                new_w = new_weights.get(symbol, 0.0)
+                delta = new_w - old_w
+                if abs(delta) < 1e-8:
+                    continue
+                price_row = prices_df[
+                    (prices_df["symbol"] == symbol) & (prices_df["date"] == td)
+                ]
+                if price_row.empty:
+                    continue
+                close_p = float(price_row.iloc[0]["close"])
+                position_value = equity * abs(delta)
+                adv = adv_lookup.get(symbol, 0)
+                slip = portfolio.cost.slippage_bps(position_value, adv)
+                tx = position_value * (portfolio.cost.base_cost_bps / 10_000)
+                sl = position_value * (slip / 10_000)
+                borrow = 0.0
+                if new_w < 0:
+                    borrow = portfolio.cost.daily_borrow_cost(equity * abs(new_w))
+
+                all_trades.append({
+                    "run_id": run_id,
+                    "date": td,
+                    "symbol": symbol,
+                    "weight": float(new_w),
+                    "position_qty": float(equity * abs(new_w) / close_p) * (1 if new_w > 0 else -1) if close_p > 0 else 0.0,
+                    "entry_price": float(close_p),
+                    "exit_price": float(close_p),
+                    "transaction_cost": float(tx + sl),
+                    "slippage_cost": float(borrow),
+                    "daily_pnl": 0.0,
+                })
+
+            current_weights = new_weights
+
+        # Daily borrow cost for shorts (accrued daily, not just on rebalance)
+        daily_borrow = sum(
+            portfolio.cost.daily_borrow_cost(equity * abs(w))
+            for sym, w in current_weights.items()
+            if w < 0
+        )
+
+        day_pnl = hold_pnl - rebalance_cost - daily_borrow
+        equity += day_pnl
+        daily_ret = day_pnl / (equity - day_pnl) if (equity - day_pnl) > 0 else 0.0
+        daily_returns.append(daily_ret)
+
+        bench_ret = portfolio._benchmark_return(prices_df, td)
+        benchmark_returns.append(bench_ret)
+        equity_curve.append({"date": str(td), "equity": round(equity, 2)})
+
+        # Update prev_closes for next day's close-to-close calculation
+        for symbol in set(list(current_weights.keys()) + list(prev_closes.keys())):
+            price_row = prices_df[
+                (prices_df["symbol"] == symbol) & (prices_df["date"] == td)
+            ]
+            if not price_row.empty:
+                prev_closes[symbol] = float(price_row.iloc[0]["close"])
+
+    metrics = _compute_metrics(
+        equity_curve, daily_returns, all_trades, cfg.starting_capital, benchmark_returns
+    )
+    _save_trades(db, all_trades)
+
+    sim_run.status = "completed"
+    sim_run.result_metrics = metrics
+    db.commit()
+
+    logger.info(
+        "Simulation %s [%s] complete: return=%.2f%%, sharpe=%.3f, "
+        "max_dd=%.2f%%, alpha=%.2f%%",
+        run_id,
+        strategy.name,
+        metrics["total_return_pct"],
+        metrics["sharpe_ratio"],
+        metrics["max_drawdown_pct"],
+        metrics.get("alpha_pct", 0),
+    )
+
+    return {
+        "run_id": run_id,
+        "strategy": strategy.name,
+        "metrics": metrics,
+        "equity_curve": equity_curve,
+        "n_trades": len(all_trades),
+        "n_trading_days": len(trading_dates),
+    }
+
+
+def _compute_turnover(
+    old_weights: dict[str, float], new_weights: dict[str, float]
+) -> float:
+    """Sum of absolute weight changes (0 = no change, 2 = full flip)."""
+    all_symbols = set(list(old_weights.keys()) + list(new_weights.keys()))
+    return sum(
+        abs(new_weights.get(s, 0.0) - old_weights.get(s, 0.0)) for s in all_symbols
+    )
+
+
+# -----------------------------------------------------------------------
+# Legacy entry point (backward-compatible)
+# -----------------------------------------------------------------------
 
 
 def run_simulation(
@@ -43,10 +337,7 @@ def run_simulation(
     live_ic_floor: float = 0.01,
     low_ic_exposure_scale: float = 0.5,
 ) -> dict:
-    """Execute a full paper-trading simulation over a date range.
-
-    Returns dict with run_id, equity curve, and performance metrics.
-    """
+    """Legacy simulation — kept for backward compatibility."""
     run_id = uuid.uuid4().hex[:16]
 
     sim_run = SimulationRun(
@@ -59,6 +350,7 @@ def run_simulation(
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
         model_version=model_version,
+        strategy_name="legacy_confidence_weighted",
         status="running",
     )
     db.add(sim_run)
@@ -79,14 +371,20 @@ def run_simulation(
         return {"run_id": run_id, "error": "No price data found"}
 
     trading_dates = sorted(predictions_df["target_date"].unique())
-    logger.info(f"Simulation {run_id}: {len(trading_dates)} trading days, capital=${starting_capital:,.0f}")
+    logger.info(
+        "Simulation %s [legacy]: %d trading days, capital=$%,.0f",
+        run_id,
+        len(trading_dates),
+        starting_capital,
+    )
 
     equity = starting_capital
     equity_curve = [{"date": str(start_date), "equity": equity}]
-    all_trades = []
-    daily_returns = []
-    daily_exposure_scales = []
-    live_ic_trace = []
+    all_trades: list[dict] = []
+    daily_returns: list[float] = []
+    benchmark_returns: list[float] = []
+    daily_exposure_scales: list[float] = []
+    live_ic_trace: list[float] = []
 
     cost_factor = (transaction_cost_bps + slippage_bps) / 10_000
 
@@ -97,6 +395,7 @@ def run_simulation(
         if day_preds.empty:
             equity_curve.append({"date": str(td), "equity": equity})
             daily_returns.append(0.0)
+            benchmark_returns.append(_spy_return(prices_df, td))
             continue
 
         day_preds = day_preds.nlargest(top_n, "confidence")
@@ -121,7 +420,7 @@ def run_simulation(
             live_ic_trace.append(float(live_ic))
 
         day_pnl = 0.0
-        day_trades = []
+        day_trades: list[dict] = []
 
         for _, pred in day_preds.iterrows():
             symbol = pred["symbol"]
@@ -142,7 +441,7 @@ def run_simulation(
                 continue
 
             position_value = equity * weight
-            direction_sign = 1.0 if pred["direction"] == "up" else -1.0
+            direction_sign = 1.0 if pred["direction"] in ("up", "outperform") else -1.0
             shares = position_value / entry_price
 
             gross_return = direction_sign * (exit_price - entry_price) / entry_price
@@ -168,16 +467,27 @@ def run_simulation(
         equity += day_pnl
         daily_ret = day_pnl / (equity - day_pnl) if (equity - day_pnl) > 0 else 0
         daily_returns.append(daily_ret)
+        benchmark_returns.append(_spy_return(prices_df, td))
         equity_curve.append({"date": str(td), "equity": round(equity, 2)})
         all_trades.extend(day_trades)
 
     metrics = _compute_metrics(
-        equity_curve, daily_returns, all_trades, starting_capital
+        equity_curve, daily_returns, all_trades, starting_capital, benchmark_returns
     )
-    metrics["avg_exposure_scale"] = round(float(np.mean(daily_exposure_scales)), 4) if daily_exposure_scales else 1.0
-    metrics["min_exposure_scale"] = round(float(np.min(daily_exposure_scales)), 4) if daily_exposure_scales else 1.0
+    metrics["avg_exposure_scale"] = (
+        round(float(np.mean(daily_exposure_scales)), 4)
+        if daily_exposure_scales
+        else 1.0
+    )
+    metrics["min_exposure_scale"] = (
+        round(float(np.min(daily_exposure_scales)), 4)
+        if daily_exposure_scales
+        else 1.0
+    )
     metrics["use_live_ic_guard"] = bool(use_live_ic_guard)
-    metrics["live_ic_avg"] = round(float(np.mean(live_ic_trace)), 5) if live_ic_trace else None
+    metrics["live_ic_avg"] = (
+        round(float(np.mean(live_ic_trace)), 5) if live_ic_trace else None
+    )
 
     _save_trades(db, all_trades)
 
@@ -186,10 +496,11 @@ def run_simulation(
     db.commit()
 
     logger.info(
-        f"Simulation {run_id} complete: "
-        f"return={metrics['total_return_pct']:.2f}%, "
-        f"sharpe={metrics['sharpe_ratio']:.3f}, "
-        f"max_dd={metrics['max_drawdown_pct']:.2f}%"
+        "Simulation %s [legacy] complete: return=%.2f%%, sharpe=%.3f, max_dd=%.2f%%",
+        run_id,
+        metrics["total_return_pct"],
+        metrics["sharpe_ratio"],
+        metrics["max_drawdown_pct"],
     )
 
     return {
@@ -201,56 +512,162 @@ def run_simulation(
     }
 
 
+# -----------------------------------------------------------------------
+# Data loaders
+# -----------------------------------------------------------------------
+
+
 def _load_predictions(
     db: Session, start_date: date, end_date: date, model_version: str | None
 ) -> pd.DataFrame:
     mv_filter = "AND p.model_version = :mv" if model_version else ""
-    params = {"start": start_date, "end": end_date}
+    params: dict = {"start": start_date, "end": end_date}
     if model_version:
         params["mv"] = model_version
 
-    result = db.execute(text(f"""
-        SELECT p.symbol, p.target_date, p.direction, p.probability_up, p.confidence, p.model_version,
-               fs.vix_level, p.realized_return
+    result = db.execute(
+        text(f"""
+        SELECT p.symbol, p.target_date, p.direction, p.probability_up,
+               p.confidence, p.model_version, fs.vix_level, p.realized_return
         FROM predictions p
         LEFT JOIN features_snapshot fs ON p.feature_snapshot_id = fs.snapshot_id
         WHERE target_date >= :start AND target_date <= :end
         {mv_filter}
         ORDER BY target_date, confidence DESC
-    """), params)
+    """),
+        params,
+    )
 
     rows = result.fetchall()
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows, columns=[
-        "symbol", "target_date", "direction", "probability_up", "confidence", "model_version", "vix_level", "realized_return"
-    ])
-    return df
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "symbol",
+            "target_date",
+            "direction",
+            "probability_up",
+            "confidence",
+            "model_version",
+            "vix_level",
+            "realized_return",
+        ],
+    )
+
+
+def _load_features(
+    db: Session, start_date: date, end_date: date
+) -> pd.DataFrame:
+    """Load features_snapshot rows for the simulation date range."""
+    result = db.execute(
+        text("""
+        SELECT fs.symbol, fs.target_session_date,
+               fs.rsi_14, fs.momentum_5d, fs.momentum_20d, fs.momentum_60d,
+               fs.short_term_reversal,
+               fs.sector_return_1d, fs.sector_return_5d,
+               fs.sector_momentum_rank, fs.vix_level,
+               fs.rolling_volatility_20d,
+               s.sector
+        FROM features_snapshot fs
+        LEFT JOIN symbols s ON fs.symbol = s.symbol
+        WHERE fs.target_session_date >= :start
+          AND fs.target_session_date <= :end
+        ORDER BY fs.target_session_date
+    """),
+        {"start": start_date, "end": end_date},
+    )
+    rows = result.fetchall()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "symbol",
+            "target_session_date",
+            "rsi_14",
+            "momentum_5d",
+            "momentum_20d",
+            "momentum_60d",
+            "short_term_reversal",
+            "sector_return_1d",
+            "sector_return_5d",
+            "sector_momentum_rank",
+            "vix_level",
+            "rolling_volatility_20d",
+            "sector",
+        ],
+    )
 
 
 def _load_prices(db: Session, start_date: date, end_date: date) -> pd.DataFrame:
-    result = db.execute(text("""
-        SELECT symbol, date, open, close
+    result = db.execute(
+        text("""
+        SELECT symbol, date, open, close, volume
         FROM market_bars_daily
         WHERE date >= :start AND date <= :end
         ORDER BY date
-    """), {"start": start_date, "end": end_date})
+    """),
+        {"start": start_date, "end": end_date},
+    )
 
     rows = result.fetchall()
     if not rows:
         return pd.DataFrame()
 
-    return pd.DataFrame(rows, columns=["symbol", "date", "open", "close"])
+    return pd.DataFrame(rows, columns=["symbol", "date", "open", "close", "volume"])
 
 
-def _compute_weights(preds_df: pd.DataFrame, max_position: float, exposure_scale: float = 1.0) -> dict[str, float]:
+def _load_market_window(db: Session, end_date: date, lookback: int = 60) -> pd.DataFrame:
+    """Load recent market bars for ADV computation."""
+    result = db.execute(
+        text("""
+        SELECT symbol, date, open, high, low, close, volume
+        FROM market_bars_daily
+        WHERE date >= :start AND date <= :end
+        ORDER BY date
+    """),
+        {"start": end_date - pd.Timedelta(days=lookback * 2), "end": end_date},
+    )
+    rows = result.fetchall()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        rows, columns=["symbol", "date", "open", "high", "low", "close", "volume"]
+    )
+
+
+# -----------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------
+
+
+def _get_vix(features_df: pd.DataFrame) -> float | None:
+    if features_df.empty or "vix_level" not in features_df.columns:
+        return None
+    vals = features_df["vix_level"].dropna()
+    return float(vals.median()) if not vals.empty else None
+
+
+def _spy_return(prices_df: pd.DataFrame, td: date) -> float:
+    spy = prices_df[(prices_df["symbol"] == "SPY") & (prices_df["date"] == td)]
+    if spy.empty:
+        return 0.0
+    o = float(spy.iloc[0]["open"])
+    c = float(spy.iloc[0]["close"])
+    return (c - o) / o if o > 0 else 0.0
+
+
+def _compute_weights(
+    preds_df: pd.DataFrame, max_position: float, exposure_scale: float = 1.0
+) -> dict[str, float]:
     """Confidence-weighted allocation with position cap."""
     total_confidence = preds_df["confidence"].sum()
     if total_confidence == 0:
         return {}
 
-    weights = {}
+    weights: dict[str, float] = {}
     for _, row in preds_df.iterrows():
         raw_weight = row["confidence"] / total_confidence
         weights[row["symbol"]] = min(raw_weight, max_position)
@@ -281,12 +698,11 @@ def _compute_exposure_scale(
     live_ic_floor: float,
     low_ic_exposure_scale: float,
 ) -> tuple[float, float | None]:
-    """Combine VIX-based and live-IC-based exposure controls."""
+    """Combine VIX-based and live-IC-based exposure controls (legacy)."""
     if not enable_regime_guard:
         return 1.0, None
 
     vix_scale = 1.0
-    vix = None
     if "vix_level" in day_preds.columns and day_preds["vix_level"].notna().any():
         vix = float(day_preds["vix_level"].median())
         if vix < vix_quarter_exposure_below:
@@ -301,7 +717,9 @@ def _compute_exposure_scale(
     live_ic = None
     ic_scale = 1.0
     if use_live_ic_guard:
-        live_ic = _compute_live_rolling_ic(db, as_of_date, live_ic_lookback_days, model_version=model_version)
+        live_ic = _compute_live_rolling_ic(
+            db, as_of_date, live_ic_lookback_days, model_version=model_version
+        )
         if live_ic is not None and live_ic < live_ic_floor:
             ic_scale = float(min(max(low_ic_exposure_scale, 0.0), 1.0))
 
@@ -314,16 +732,17 @@ def _compute_live_rolling_ic(
     lookback_days: int,
     model_version: str | None = None,
 ) -> float | None:
-    """Compute trailing mean daily IC from realized predictions before as_of_date."""
+    """Compute trailing mean daily IC from realized predictions."""
     mv_filter = "AND model_version = :mv" if model_version else ""
-    params = {
+    params: dict = {
         "start": as_of_date - pd.Timedelta(days=lookback_days),
         "end": as_of_date,
     }
     if model_version:
         params["mv"] = model_version
 
-    result = db.execute(text(f"""
+    result = db.execute(
+        text(f"""
         SELECT target_date, probability_up, realized_return
         FROM predictions
         WHERE target_date >= :start
@@ -331,7 +750,9 @@ def _compute_live_rolling_ic(
           AND realized_return IS NOT NULL
           {mv_filter}
         ORDER BY target_date
-    """), params)
+    """),
+        params,
+    )
     rows = result.fetchall()
     if not rows:
         return None
@@ -339,7 +760,7 @@ def _compute_live_rolling_ic(
     df = pd.DataFrame(rows, columns=["target_date", "probability_up", "realized_return"])
     if df.empty:
         return None
-    daily_ics = []
+    daily_ics: list[float] = []
     for _, day_df in df.groupby("target_date"):
         if len(day_df) < 10:
             continue
@@ -351,22 +772,55 @@ def _compute_live_rolling_ic(
     return float(np.mean(daily_ics))
 
 
+def _newey_west_sharpe(returns: np.ndarray, lag: int = 4) -> float:
+    """Newey-West adjusted Sharpe for serially correlated daily returns."""
+    arr = np.asarray(returns, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    n = len(arr)
+    if n < 2:
+        return 0.0
+    std = float(np.std(arr, ddof=1))
+    if std <= 0:
+        return 0.0
+    base_sr = float((np.mean(arr) / std) * np.sqrt(252))
+    if lag <= 0:
+        return base_sr
+    x = arr - float(np.mean(arr))
+    var0 = float(np.dot(x, x) / (n - 1))
+    if var0 <= 0:
+        return base_sr
+    rho_sum = 0.0
+    for k in range(1, min(lag, n - 1) + 1):
+        gamma_k = float(np.dot(x[k:], x[:-k]) / (n - 1))
+        weight = 1.0 - (k / (lag + 1.0))
+        rho_sum += weight * (gamma_k / var0)
+    adj = np.sqrt(max(1e-12, 1.0 + 2.0 * rho_sum))
+    return float(base_sr / adj)
+
+
 def _compute_metrics(
     equity_curve: list[dict],
     daily_returns: list[float],
     trades: list[dict],
     starting_capital: float,
+    benchmark_returns: list[float] | None = None,
+    nw_lag: int = 4,
 ) -> dict:
-    """Compute simulation performance metrics."""
+    """Compute simulation performance metrics with Newey-West adjusted Sharpe."""
     final_equity = equity_curve[-1]["equity"] if equity_curve else starting_capital
     total_return = (final_equity - starting_capital) / starting_capital
 
     returns = np.array(daily_returns) if daily_returns else np.array([0.0])
     trading_days = len(returns)
 
+    annualized_return = (
+        ((1 + total_return) ** (252 / max(trading_days, 1)) - 1) * 100
+    )
+
     sharpe = 0.0
     if returns.std() > 0 and trading_days > 1:
         sharpe = (returns.mean() / returns.std()) * np.sqrt(252)
+    sharpe_nw = _newey_west_sharpe(returns, lag=nw_lag)
 
     equities = [e["equity"] for e in equity_curve]
     peak = equities[0]
@@ -381,15 +835,16 @@ def _compute_metrics(
     total_trades = len(trades)
     win_rate = wins / total_trades if total_trades > 0 else 0
 
-    total_costs = sum(t["transaction_cost"] for t in trades)
+    total_costs = sum(t["transaction_cost"] + t.get("slippage_cost", 0) for t in trades)
 
     unique_days = len(set(t["date"] for t in trades)) if trades else 0
     avg_daily_turnover = total_trades / unique_days if unique_days > 0 else 0
 
-    return {
+    result = {
         "total_return_pct": round(total_return * 100, 4),
-        "annualized_return_pct": round(total_return * (252 / max(trading_days, 1)) * 100, 4),
+        "annualized_return_pct": round(annualized_return, 4),
         "sharpe_ratio": round(sharpe, 4),
+        "sharpe_ratio_nw": round(sharpe_nw, 4),
         "max_drawdown_pct": round(max_dd * 100, 4),
         "win_rate": round(win_rate, 4),
         "total_trades": total_trades,
@@ -399,6 +854,34 @@ def _compute_metrics(
         "final_equity": round(final_equity, 2),
         "net_profit": round(final_equity - starting_capital, 2),
     }
+
+    # Benchmark comparison
+    if benchmark_returns:
+        bench = np.array(benchmark_returns)
+        cum_bench = float(np.prod(1 + bench) - 1)
+        result["benchmark_return_pct"] = round(cum_bench * 100, 4)
+        result["alpha_pct"] = round((total_return - cum_bench) * 100, 4)
+
+        if len(bench) > 1 and bench.std() > 0:
+            cov = np.cov(returns[: len(bench)], bench)[0, 1]
+            beta = cov / bench.var() if bench.var() > 0 else 0
+            result["beta"] = round(float(beta), 4)
+
+            tracking_error = float(np.std(returns[: len(bench)] - bench, ddof=1))
+            if tracking_error > 0:
+                result["information_ratio"] = round(
+                    float(np.mean(returns[: len(bench)] - bench))
+                    / tracking_error
+                    * np.sqrt(252),
+                    4,
+                )
+
+    return result
+
+
+# -----------------------------------------------------------------------
+# Persistence
+# -----------------------------------------------------------------------
 
 
 def _sanitize_trade(trade: dict) -> dict:

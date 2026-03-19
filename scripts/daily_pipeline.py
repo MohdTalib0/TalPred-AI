@@ -1,14 +1,16 @@
 """Daily EOD pipeline orchestrator (ENG-SPEC 14).
 
 Runs the full daily pipeline in order:
-1. Market calendar sync
-2. Ingest market data
-3. Ingest news
-4. Ingest macro data
-5. Feature generation
-6. Batch predictions
-7. Redis cache update (part of batch predict)
-8. Monitoring checks
+ 1. Market calendar sync
+ 2. Ingest market data + data quality checks
+ 3. Ingest news
+ 4. Ingest macro data
+ 5. Feature generation
+ 6. Batch predictions
+ 7. Outcome backfill (realized returns)
+ 8. Monitoring checks
+ 9. Paper trading
+10. Ingest fundamental features (Mondays only)
 
 Usage:
   python -m scripts.daily_pipeline              # run full pipeline
@@ -21,7 +23,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from dotenv import load_dotenv
 from sqlalchemy import text
@@ -65,8 +67,8 @@ def step_1_calendar_sync(db):
 
 
 def step_2_ingest_market(db):
-    """Ingest latest market bars."""
-    from src.pipelines.ingest_market import ingest_universe
+    """Ingest latest market bars + post-ingestion data quality checks."""
+    from src.pipelines.ingest_market import ingest_universe, run_data_quality_checks
     logger.info("Step 2: Market data ingestion")
     try:
         symbols = _get_active_symbols(db)
@@ -82,6 +84,15 @@ def step_2_ingest_market(db):
             max_workers=workers,
         )
         logger.info(f"  Market ingestion complete: {result}")
+
+        dq_report = run_data_quality_checks(db, symbols, lookback_days=30)
+        logger.info(
+            f"  Data quality: {dq_report['overall_status']} "
+            f"(gaps={len(dq_report['gap_analysis'])}, "
+            f"splits={len(dq_report['split_suspects'])}, "
+            f"vol_anomalies={len(dq_report['volume_anomalies'])}, "
+            f"mkt_rel_outliers={len(dq_report.get('market_relative_outliers', []))})"
+        )
     except Exception:
         logger.exception("  Market ingestion failed")
 
@@ -178,10 +189,25 @@ def step_6_batch_predict(db):
         logger.exception("  Batch prediction failed")
 
 
-def step_7_monitoring(db):
+def step_7_outcome_backfill(db):
+    """Backfill realized outcomes for past predictions (live IC tracking)."""
+    from src.pipelines.outcome_backfill import backfill_realized_outcomes
+    logger.info("Step 7: Outcome backfill (realized returns)")
+    try:
+        result = backfill_realized_outcomes(db, lookback_days=7)
+        logger.info(
+            f"  Backfilled: {result['updated']} predictions, "
+            f"skipped: {result['skipped']}"
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("  Outcome backfill failed")
+
+
+def step_8_monitoring(db):
     """Run monitoring checks."""
     from src.monitoring.checks import run_all_checks
-    logger.info("Step 7: Monitoring checks")
+    logger.info("Step 8: Monitoring checks")
     try:
         report = run_all_checks(db)
         logger.info(
@@ -196,10 +222,15 @@ def step_7_monitoring(db):
         logger.exception("  Monitoring checks failed")
 
 
-def step_8_paper_trading(db):
+def step_9_paper_trading(db):
     """Run paper monitor and persist daily simulation run/trades to DB."""
     from src.models.schema import SimulationRun
-    from src.simulation.engine import run_simulation
+    from src.simulation.engine import run_simulation, run_strategy_simulation
+    from src.strategies.config import StrategyFrameworkConfig
+    from src.strategies.mean_reversion import MeanReversion
+    from src.strategies.momentum_long_short import MomentumLongShort
+    from src.strategies.momentum_reversal import MomentumReversal
+    from src.strategies.sector_rotation import SectorRotation
 
     logger.info("Step 8: Paper trading monitor")
     try:
@@ -224,7 +255,7 @@ def step_8_paper_trading(db):
         db.rollback()
         logger.exception("  Paper trading monitor failed")
 
-    # Persist DB-native simulation/paper-trade records for daily tracking.
+    # ---------- Resolve eligible simulation date + model version ----------
     try:
         sim_date = db.execute(
             text("""
@@ -255,45 +286,127 @@ def step_8_paper_trading(db):
             """),
             {"td": sim_date},
         ).scalar()
+    except Exception:
+        db.rollback()
+        logger.exception("  DB simulation date resolution failed")
+        return
 
-        existing = (
+    # ---------- Legacy simulation (backward-compatible) ----------
+    try:
+        existing_legacy = (
             db.query(SimulationRun)
             .filter(
                 SimulationRun.start_date == sim_date,
                 SimulationRun.end_date == sim_date,
                 SimulationRun.model_version == model_version,
+                SimulationRun.strategy_name == "legacy_confidence_weighted",
                 SimulationRun.status == "completed",
             )
             .first()
         )
-        if existing:
+        if existing_legacy:
             logger.info(
-                f"  DB simulation skipped: already exists for {sim_date} "
-                f"(run_id={existing.run_id})"
-            )
-            return
-
-        sim_result = run_simulation(
-            db,
-            start_date=sim_date,
-            end_date=sim_date,
-            min_confidence_trade=float(os.getenv("MIN_CONFIDENCE_TRADE", "0.60")),
-            max_position=float(os.getenv("MAX_POSITION", "0.05")),
-            top_n=int(os.getenv("PAPER_TOP_N", "20")),
-            model_version=model_version,
-        )
-        if "error" in sim_result:
-            logger.warning(
-                f"  DB simulation failed for {sim_date}: {sim_result['error']}"
+                f"  Legacy simulation skipped: already exists for {sim_date} "
+                f"(run_id={existing_legacy.run_id})"
             )
         else:
-            logger.info(
-                f"  DB simulation saved: run_id={sim_result['run_id']}, "
-                f"trades={sim_result.get('n_trades', 0)}, days={sim_result.get('n_trading_days', 0)}"
+            sim_result = run_simulation(
+                db,
+                start_date=sim_date,
+                end_date=sim_date,
+                min_confidence_trade=float(os.getenv("MIN_CONFIDENCE_TRADE", "0.60")),
+                max_position=float(os.getenv("MAX_POSITION", "0.05")),
+                top_n=int(os.getenv("PAPER_TOP_N", "20")),
+                model_version=model_version,
             )
+            if "error" in sim_result:
+                logger.warning(
+                    f"  Legacy simulation failed for {sim_date}: {sim_result['error']}"
+                )
+            else:
+                logger.info(
+                    f"  Legacy simulation saved: run_id={sim_result['run_id']}, "
+                    f"trades={sim_result.get('n_trades', 0)}"
+                )
     except Exception:
         db.rollback()
-        logger.exception("  DB simulation persistence failed")
+        logger.exception("  Legacy simulation persistence failed")
+
+    # ---------- Strategy framework simulations ----------
+    if not _as_bool_env("STRATEGY_FRAMEWORK_ENABLED", "1"):
+        logger.info("  Strategy framework disabled (STRATEGY_FRAMEWORK_ENABLED=0)")
+        return
+
+    cfg = StrategyFrameworkConfig()
+    strategies = [
+        MomentumLongShort(cfg.momentum),
+        SectorRotation(cfg.sector_rotation),
+        MeanReversion(cfg.mean_reversion),
+        MomentumReversal(cfg.momentum_reversal),
+    ]
+
+    for strategy in strategies:
+        try:
+            existing = (
+                db.query(SimulationRun)
+                .filter(
+                    SimulationRun.start_date == sim_date,
+                    SimulationRun.end_date == sim_date,
+                    SimulationRun.model_version == model_version,
+                    SimulationRun.strategy_name == strategy.name,
+                    SimulationRun.status == "completed",
+                )
+                .first()
+            )
+            if existing:
+                logger.info(
+                    f"  [{strategy.name}] skipped: already exists "
+                    f"(run_id={existing.run_id})"
+                )
+                continue
+
+            result = run_strategy_simulation(
+                db,
+                strategy=strategy,
+                start_date=sim_date,
+                end_date=sim_date,
+                config=cfg,
+                model_version=model_version,
+            )
+            if "error" in result:
+                logger.warning(
+                    f"  [{strategy.name}] failed for {sim_date}: {result['error']}"
+                )
+            else:
+                metrics = result.get("metrics", {})
+                logger.info(
+                    f"  [{strategy.name}] saved: run_id={result['run_id']}, "
+                    f"trades={result.get('n_trades', 0)}, "
+                    f"return={metrics.get('total_return_pct', 0):.4f}%, "
+                    f"alpha={metrics.get('alpha_pct', 0):.4f}%"
+                )
+        except Exception:
+            db.rollback()
+            logger.exception(f"  [{strategy.name}] simulation failed")
+
+
+def step_10_ingest_fundamentals(db):
+    """Ingest fundamental features (SEC EDGAR / yfinance / SimFin). Monday only."""
+    if datetime.today().weekday() != 0:
+        logger.info("Step 10: Skipping fundamentals (not Monday)")
+        return
+    from src.pipelines.ingest_fundamentals import ingest_fundamentals
+    logger.info("Step 10: Ingesting fundamental features")
+    try:
+        symbols = _get_active_symbols(db)
+        result = ingest_fundamentals(db, symbols, lookback_years=2)
+        logger.info(
+            f"  Fundamentals complete: {result['upserted']} upserted, "
+            f"{result['symbols_covered']} symbols, {result['skipped']} skipped"
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("  Fundamentals ingestion failed")
 
 
 STEPS = [
@@ -303,14 +416,16 @@ STEPS = [
     step_4_ingest_macro,
     step_5_generate_features,
     step_6_batch_predict,
-    step_7_monitoring,
-    step_8_paper_trading,
+    step_7_outcome_backfill,
+    step_8_monitoring,
+    step_9_paper_trading,
+    step_10_ingest_fundamentals,
 ]
 
 
 def main():
     parser = argparse.ArgumentParser(description="Daily EOD pipeline")
-    parser.add_argument("--step", type=int, default=1, help="Start from this step (1-8)")
+    parser.add_argument("--step", type=int, default=1, help="Start from this step (1-10)")
     args = parser.parse_args()
 
     db = SessionLocal()

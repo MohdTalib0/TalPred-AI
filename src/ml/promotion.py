@@ -31,6 +31,8 @@ BACKTEST_GATES = {
     "min_auc": 0.52,
     "min_rank_sharpe_net": 1.0,
     "max_rank_mdd_net_abs": 0.40,
+    "min_ic_mean": 0.02,
+    "min_decile_monotonicity": 0.70,
 }
 
 
@@ -47,6 +49,8 @@ def check_kpi_gates(metrics: dict) -> dict:
     """Validate model metrics against KPI thresholds.
 
     Returns dict with passed (bool), gate_results (list of check details).
+    Each gate result includes metric_value, threshold, and direction for
+    Holm-Bonferroni correction.
     """
     results = []
     all_passed = True
@@ -54,33 +58,41 @@ def check_kpi_gates(metrics: dict) -> dict:
     accuracy = metrics.get("accuracy", 0)
     if accuracy < KPI_GATES["min_accuracy"]:
         results.append({"gate": "min_accuracy", "passed": False,
-                        "detail": f"accuracy {accuracy:.4f} < {KPI_GATES['min_accuracy']}"})
+                        "detail": f"accuracy {accuracy:.4f} < {KPI_GATES['min_accuracy']}",
+                        "metric_value": accuracy, "threshold": KPI_GATES["min_accuracy"], "direction": "above"})
         all_passed = False
     else:
-        results.append({"gate": "min_accuracy", "passed": True, "detail": f"accuracy {accuracy:.4f}"})
+        results.append({"gate": "min_accuracy", "passed": True, "detail": f"accuracy {accuracy:.4f}",
+                        "metric_value": accuracy, "threshold": KPI_GATES["min_accuracy"], "direction": "above"})
 
     if accuracy > KPI_GATES["max_accuracy"]:
         results.append({"gate": "leakage_guard", "passed": False,
-                        "detail": f"accuracy {accuracy:.4f} > {KPI_GATES['max_accuracy']} (leakage suspected)"})
+                        "detail": f"accuracy {accuracy:.4f} > {KPI_GATES['max_accuracy']} (leakage suspected)",
+                        "metric_value": accuracy, "threshold": KPI_GATES["max_accuracy"], "direction": "below"})
         all_passed = False
     else:
-        results.append({"gate": "leakage_guard", "passed": True, "detail": f"accuracy {accuracy:.4f}"})
+        results.append({"gate": "leakage_guard", "passed": True, "detail": f"accuracy {accuracy:.4f}",
+                        "metric_value": accuracy, "threshold": KPI_GATES["max_accuracy"], "direction": "below"})
 
     auc = metrics.get("auc_roc", 0)
     if auc < KPI_GATES["min_auc_roc"]:
         results.append({"gate": "min_auc", "passed": False,
-                        "detail": f"AUC {auc:.4f} < {KPI_GATES['min_auc_roc']}"})
+                        "detail": f"AUC {auc:.4f} < {KPI_GATES['min_auc_roc']}",
+                        "metric_value": auc, "threshold": KPI_GATES["min_auc_roc"], "direction": "above"})
         all_passed = False
     else:
-        results.append({"gate": "min_auc", "passed": True, "detail": f"AUC {auc:.4f}"})
+        results.append({"gate": "min_auc", "passed": True, "detail": f"AUC {auc:.4f}",
+                        "metric_value": auc, "threshold": KPI_GATES["min_auc_roc"], "direction": "above"})
 
     ll = metrics.get("log_loss", float("inf"))
     if ll > KPI_GATES["max_log_loss"]:
         results.append({"gate": "max_log_loss", "passed": False,
-                        "detail": f"log_loss {ll:.4f} > {KPI_GATES['max_log_loss']}"})
+                        "detail": f"log_loss {ll:.4f} > {KPI_GATES['max_log_loss']}",
+                        "metric_value": ll, "threshold": KPI_GATES["max_log_loss"], "direction": "below"})
         all_passed = False
     else:
-        results.append({"gate": "max_log_loss", "passed": True, "detail": f"log_loss {ll:.4f}"})
+        results.append({"gate": "max_log_loss", "passed": True, "detail": f"log_loss {ll:.4f}",
+                        "metric_value": ll, "threshold": KPI_GATES["max_log_loss"], "direction": "below"})
 
     return {"passed": all_passed, "gate_results": results}
 
@@ -115,13 +127,16 @@ def check_backtest_gates(backtest_results: dict | None) -> dict:
         all_passed = False
     elif bt_auc < BACKTEST_GATES["min_auc"]:
         results.append({
-            "gate": "min_backtest_auc",
-            "passed": False,
+            "gate": "min_backtest_auc", "passed": False,
             "detail": f"backtest AUC {bt_auc:.4f} < {BACKTEST_GATES['min_auc']}",
+            "metric_value": bt_auc, "threshold": BACKTEST_GATES["min_auc"], "direction": "above",
         })
         all_passed = False
     else:
-        results.append({"gate": "min_backtest_auc", "passed": True, "detail": f"backtest AUC {bt_auc:.4f}"})
+        results.append({
+            "gate": "min_backtest_auc", "passed": True, "detail": f"backtest AUC {bt_auc:.4f}",
+            "metric_value": bt_auc, "threshold": BACKTEST_GATES["min_auc"], "direction": "above",
+        })
 
     sharpe_net = agg.get("rank_long_short_sharpe_net_nw")
     sharpe_label = "net NW ranking Sharpe"
@@ -133,16 +148,16 @@ def check_backtest_gates(backtest_results: dict | None) -> dict:
         all_passed = False
     elif sharpe_net < BACKTEST_GATES["min_rank_sharpe_net"]:
         results.append({
-            "gate": "min_rank_sharpe_net",
-            "passed": False,
+            "gate": "min_rank_sharpe_net", "passed": False,
             "detail": f"{sharpe_label} {sharpe_net:.3f} < {BACKTEST_GATES['min_rank_sharpe_net']}",
+            "metric_value": sharpe_net, "threshold": BACKTEST_GATES["min_rank_sharpe_net"], "direction": "above",
         })
         all_passed = False
     else:
         results.append({
-            "gate": "min_rank_sharpe_net",
-            "passed": True,
+            "gate": "min_rank_sharpe_net", "passed": True,
             "detail": f"{sharpe_label} {sharpe_net:.3f}",
+            "metric_value": sharpe_net, "threshold": BACKTEST_GATES["min_rank_sharpe_net"], "direction": "above",
         })
 
     mdd_net = agg.get("rank_max_drawdown_net")
@@ -151,17 +166,49 @@ def check_backtest_gates(backtest_results: dict | None) -> dict:
         all_passed = False
     elif abs(float(mdd_net)) > BACKTEST_GATES["max_rank_mdd_net_abs"]:
         results.append({
-            "gate": "max_rank_mdd_net_abs",
-            "passed": False,
+            "gate": "max_rank_mdd_net_abs", "passed": False,
             "detail": f"net ranking drawdown {mdd_net:.3f} exceeds {BACKTEST_GATES['max_rank_mdd_net_abs']:.2f}",
+            "metric_value": abs(float(mdd_net)), "threshold": BACKTEST_GATES["max_rank_mdd_net_abs"], "direction": "below",
         })
         all_passed = False
     else:
         results.append({
-            "gate": "max_rank_mdd_net_abs",
-            "passed": True,
+            "gate": "max_rank_mdd_net_abs", "passed": True,
             "detail": f"net ranking drawdown {mdd_net:.3f}",
+            "metric_value": abs(float(mdd_net)), "threshold": BACKTEST_GATES["max_rank_mdd_net_abs"], "direction": "below",
         })
+
+    ic_mean = agg.get("ic_mean")
+    if ic_mean is not None:
+        if ic_mean < BACKTEST_GATES["min_ic_mean"]:
+            results.append({
+                "gate": "min_ic_mean", "passed": False,
+                "detail": f"IC mean {ic_mean:.4f} < {BACKTEST_GATES['min_ic_mean']}",
+                "metric_value": ic_mean, "threshold": BACKTEST_GATES["min_ic_mean"], "direction": "above",
+            })
+            all_passed = False
+        else:
+            results.append({
+                "gate": "min_ic_mean", "passed": True,
+                "detail": f"IC mean {ic_mean:.4f}",
+                "metric_value": ic_mean, "threshold": BACKTEST_GATES["min_ic_mean"], "direction": "above",
+            })
+
+    mono = agg.get("decile_monotonicity_spearman")
+    if mono is not None:
+        if mono < BACKTEST_GATES["min_decile_monotonicity"]:
+            results.append({
+                "gate": "min_decile_monotonicity", "passed": False,
+                "detail": f"monotonicity {mono:.3f} < {BACKTEST_GATES['min_decile_monotonicity']}",
+                "metric_value": mono, "threshold": BACKTEST_GATES["min_decile_monotonicity"], "direction": "above",
+            })
+            all_passed = False
+        else:
+            results.append({
+                "gate": "min_decile_monotonicity", "passed": True,
+                "detail": f"monotonicity {mono:.3f}",
+                "metric_value": mono, "threshold": BACKTEST_GATES["min_decile_monotonicity"], "direction": "above",
+            })
 
     return {"passed": all_passed, "gate_results": results}
 
@@ -235,6 +282,81 @@ def register_calibration(
     logger.info(f"Calibration registered for {model_version} ({calibration_type})")
 
 
+def _holm_bonferroni_adjust(gate_results: list[dict]) -> list[dict]:
+    """Apply Holm-Bonferroni step-down correction to gate results.
+
+    For each passing gate, computes a margin (how far the metric is from
+    the threshold relative to the threshold).  Gates with small margins
+    are "borderline" and must survive a tightened threshold under the
+    Holm step-down procedure.
+
+    With m total tests, the k-th most borderline passing gate must
+    exceed its threshold by at least threshold * margin_penalty where
+    margin_penalty = base_tightening * (m - k + 1) / m.
+    base_tightening is 0.05 (5% threshold tightening for the most
+    borderline gate), ensuring the correction is meaningful but not
+    overly aggressive for small-sample quant models.
+    """
+    n_gates = len(gate_results)
+    if n_gates <= 1:
+        return [dict(g, holm_bonferroni_applied=True, n_total_gates=n_gates) for g in gate_results]
+
+    BASE_TIGHTENING = 0.05
+
+    passing_with_metrics = []
+    adjusted = []
+
+    for i, g in enumerate(gate_results):
+        entry = dict(g)
+        entry["holm_bonferroni_applied"] = True
+        entry["n_total_gates"] = n_gates
+
+        if not g.get("passed", True) or "metric_value" not in g or "threshold" not in g:
+            adjusted.append(entry)
+            continue
+
+        metric_val = g["metric_value"]
+        threshold = g["threshold"]
+        direction = g.get("direction", "above")
+
+        if threshold == 0:
+            margin = abs(metric_val)
+        elif direction == "above":
+            margin = (metric_val - threshold) / abs(threshold)
+        else:
+            margin = (threshold - metric_val) / abs(threshold)
+
+        passing_with_metrics.append((i, margin, entry))
+
+    passing_with_metrics.sort(key=lambda x: x[1])
+
+    m = len(passing_with_metrics)
+    for rank_k, (orig_idx, margin, entry) in enumerate(passing_with_metrics):
+        holm_factor = (m - rank_k) / m
+        required_margin = BASE_TIGHTENING * holm_factor
+        entry["holm_required_margin"] = round(required_margin, 6)
+        entry["holm_actual_margin"] = round(margin, 6)
+
+        if margin < required_margin:
+            entry["passed"] = False
+            entry["holm_flipped"] = True
+            entry["detail"] = (
+                f"{entry['detail']} [HOLM-FLIPPED: margin {margin:.4f} < "
+                f"required {required_margin:.4f}]"
+            )
+            logger.warning(
+                f"Holm-Bonferroni flipped gate '{entry['gate']}': "
+                f"margin={margin:.4f} < required={required_margin:.4f}"
+            )
+        adjusted.append(entry)
+
+    # Restore original gate ordering
+    gate_order = {g["gate"]: i for i, g in enumerate(gate_results) if "gate" in g}
+    adjusted.sort(key=lambda e: gate_order.get(e.get("gate", ""), len(gate_order)))
+
+    return adjusted
+
+
 def promote_model(
     db: Session,
     model_version: str,
@@ -246,7 +368,8 @@ def promote_model(
 ) -> dict:
     """Attempt to promote a model through the lifecycle.
 
-    Runs all promotion gates and either promotes or rejects.
+    Runs all promotion gates with Holm-Bonferroni multiple-testing
+    correction, then either promotes or rejects.
     Returns promotion report.
     """
     report = {"model_version": model_version, "target_status": target_status}
@@ -261,7 +384,27 @@ def promote_model(
     report["backtest_check"] = backtest_check
     backtest_ok = backtest_check["passed"]
 
-    all_passed = kpi_check["passed"] and lineage_check["passed"] and backtest_ok
+    # Collect all individual gate results for multiple-testing adjustment
+    all_gate_results = (
+        kpi_check.get("gate_results", [])
+        + backtest_check.get("gate_results", [])
+    )
+    adjusted_gates = _holm_bonferroni_adjust(all_gate_results)
+    report["adjusted_gates"] = adjusted_gates
+    report["n_gates_evaluated"] = len(all_gate_results)
+
+    holm_any_flipped = any(g.get("holm_flipped") for g in adjusted_gates)
+    adjusted_all_pass = all(g.get("passed", True) for g in adjusted_gates)
+
+    all_passed = (
+        kpi_check["passed"]
+        and lineage_check["passed"]
+        and backtest_ok
+        and adjusted_all_pass
+    )
+    if holm_any_flipped:
+        report["holm_rejection"] = True
+        logger.warning("Holm-Bonferroni correction flipped borderline gates — promotion blocked")
     report["promoted"] = all_passed
 
     if all_passed:

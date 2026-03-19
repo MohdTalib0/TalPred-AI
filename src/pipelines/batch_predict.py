@@ -9,6 +9,7 @@ Runs after market close once features are generated:
 """
 
 import hashlib
+import json
 import logging
 import os
 import pickle
@@ -34,6 +35,9 @@ TOP_K_FACTORS = 5
 LOCAL_PROD_MODEL_PATH = os.path.join("artifacts", "production_model", "model.json")
 LOCAL_PROD_MEDIANS_PATH = os.path.join(
     "artifacts", "production_model", "train_medians.pkl"
+)
+LOCAL_PROD_METADATA_PATH = os.path.join(
+    "artifacts", "production_model", "metadata.json"
 )
 
 
@@ -181,20 +185,32 @@ def load_latest_snapshots(db: Session, target_date: date | None = None) -> pd.Da
     return df
 
 
-def resolve_next_trading_day(db: Session, feature_date: date) -> date:
-    """Get next trading day after feature_date from market_calendar or heuristic."""
-    result = db.execute(text("""
-        SELECT MIN(session_date) FROM market_calendar
-        WHERE session_date > :fd AND is_holiday = false
-    """), {"fd": feature_date})
-    row = result.fetchone()
-    if row and row[0]:
-        return row[0]
+def resolve_nth_trading_day(db: Session, feature_date: date, n: int = 1) -> date:
+    """Get the Nth trading day after feature_date.
 
-    next_day = feature_date + timedelta(days=1)
-    while next_day.weekday() >= 5:
-        next_day += timedelta(days=1)
-    return next_day
+    Tries market_calendar first; falls back to skipping weekends.
+    """
+    result = db.execute(
+        text("""
+            SELECT session_date FROM market_calendar
+            WHERE session_date > :fd AND is_holiday = false
+            ORDER BY session_date
+            LIMIT :n
+        """),
+        {"fd": feature_date, "n": n},
+    )
+    rows = result.fetchall()
+    if rows and len(rows) == n:
+        return rows[-1][0]
+
+    # Heuristic fallback: skip weekends
+    day = feature_date
+    count = 0
+    while count < n:
+        day += timedelta(days=1)
+        if day.weekday() < 5:
+            count += 1
+    return day
 
 
 def compute_shap_factors_from_vector(
@@ -251,6 +267,22 @@ def _align_features_to_model(model, X: pd.DataFrame) -> pd.DataFrame:
     return X
 
 
+def _load_model_metadata() -> dict:
+    """Read production model metadata (target_mode, target_horizon_days, etc.)."""
+    if not os.path.exists(LOCAL_PROD_METADATA_PATH):
+        return {}
+    try:
+        with open(LOCAL_PROD_METADATA_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_target_mode() -> str:
+    """Read target_mode from production model metadata (default: absolute)."""
+    return _load_model_metadata().get("target_mode", "absolute")
+
+
 def _load_local_train_medians() -> pd.Series | None:
     if not os.path.exists(LOCAL_PROD_MEDIANS_PATH):
         return None
@@ -264,6 +296,134 @@ def _load_local_train_medians() -> pd.Series | None:
     except Exception:
         logger.warning("Failed to load local train medians, using inference medians")
     return None
+
+
+def _compute_alpha_features(
+    db: Session,
+    inf_df: pd.DataFrame,
+    feature_date: date,
+    expected_cols: list[str] | None,
+) -> pd.DataFrame:
+    """Compute cross-sectional alpha features that aren't in the snapshot.
+
+    These match the training-time features built in leakage.py / engine.py:
+      vol_adj_momentum_20d/60d, pct_from_52w_high, idio_momentum_20d/60d,
+      vol_price_divergence, and their _rank variants.
+    """
+    needed = {
+        "vol_adj_momentum_20d",
+        "vol_adj_momentum_60d",
+        "pct_from_52w_high",
+        "idio_momentum_20d",
+        "idio_momentum_60d",
+        "vol_price_divergence",
+        "vol_adj_momentum_20d_rank",
+        "pct_from_52w_high_rank",
+        "idio_momentum_20d_rank",
+    }
+    if expected_cols and not needed.intersection(expected_cols):
+        return inf_df
+
+    # vol-adjusted momentum (only needs snapshot columns)
+    if "momentum_20d" in inf_df.columns and "rolling_volatility_20d" in inf_df.columns:
+        vol20 = inf_df["rolling_volatility_20d"].clip(lower=0.001)
+        if "vol_adj_momentum_20d" not in inf_df.columns:
+            inf_df["vol_adj_momentum_20d"] = inf_df["momentum_20d"] / vol20
+        if "vol_adj_momentum_60d" not in inf_df.columns and "momentum_60d" in inf_df.columns:
+            inf_df["vol_adj_momentum_60d"] = inf_df["momentum_60d"] / vol20
+
+    # 52-week high proximity — query 252-day max close per symbol
+    if "pct_from_52w_high" not in inf_df.columns:
+        high52_rows = db.execute(
+            text("""
+                SELECT symbol, MAX(close) AS high_52w
+                FROM market_bars_daily
+                WHERE date >= :start AND date <= :end
+                  AND symbol = ANY(:syms)
+                GROUP BY symbol
+            """),
+            {
+                "start": feature_date - timedelta(days=365),
+                "end": feature_date,
+                "syms": list(inf_df["symbol"].unique()),
+            },
+        ).fetchall()
+        if high52_rows:
+            h52 = pd.DataFrame(high52_rows, columns=["symbol", "high_52w"])
+            inf_df = inf_df.merge(h52, on="symbol", how="left")
+            # Use the snapshot's close or the latest market close for the ratio
+            close_col = "close" if "close" in inf_df.columns else None
+            if close_col is None:
+                close_rows = db.execute(
+                    text("""
+                        SELECT symbol, close FROM market_bars_daily
+                        WHERE date = :d AND symbol = ANY(:syms)
+                    """),
+                    {"d": feature_date, "syms": list(inf_df["symbol"].unique())},
+                ).fetchall()
+                if close_rows:
+                    cl = pd.DataFrame(close_rows, columns=["symbol", "_close_latest"])
+                    inf_df = inf_df.merge(cl, on="symbol", how="left")
+                    close_col = "_close_latest"
+            if close_col and "high_52w" in inf_df.columns:
+                inf_df["pct_from_52w_high"] = (
+                    inf_df[close_col] / inf_df["high_52w"].clip(lower=0.01)
+                )
+                inf_df = inf_df.drop(columns=["high_52w"], errors="ignore")
+                if close_col == "_close_latest":
+                    inf_df = inf_df.drop(columns=["_close_latest"], errors="ignore")
+
+    # Idiosyncratic momentum — stock momentum minus SPY momentum
+    needs_idio = (
+        "idio_momentum_20d" not in inf_df.columns
+        and "momentum_20d" in inf_df.columns
+    )
+    if needs_idio:
+        spy_row = db.execute(
+            text("""
+                SELECT close FROM market_bars_daily
+                WHERE symbol = 'SPY' AND date <= :d
+                ORDER BY date DESC LIMIT 61
+            """),
+            {"d": feature_date},
+        ).fetchall()
+        if spy_row and len(spy_row) >= 21:
+            spy_closes = [float(r[0]) for r in reversed(spy_row)]
+            spy_mom20 = (spy_closes[-1] / spy_closes[-21]) - 1
+            spy_mom60 = (
+                (spy_closes[-1] / spy_closes[-61]) - 1
+                if len(spy_closes) >= 61
+                else spy_mom20
+            )
+            inf_df["idio_momentum_20d"] = inf_df["momentum_20d"] - spy_mom20
+            if "momentum_60d" in inf_df.columns:
+                inf_df["idio_momentum_60d"] = inf_df["momentum_60d"] - spy_mom60
+
+    # Volume-price divergence (cross-sectional rank difference per date,
+    # matching training pipeline's groupby("target_session_date")).
+    # Must use momentum_5d to match training (leakage.py), NOT momentum_20d.
+    date_col = "target_session_date"
+    if (
+        "vol_price_divergence" not in inf_df.columns
+        and "volume_change_5d" in inf_df.columns
+    ):
+        mom_col = "momentum_5d" if "momentum_5d" in inf_df.columns else "momentum_20d"
+        inf_df["vol_price_divergence"] = (
+            inf_df.groupby(date_col)["volume_change_5d"].rank(pct=True)
+            - inf_df.groupby(date_col)[mom_col].rank(pct=True)
+        )
+
+    # Cross-sectional ranks for alpha features (per date, matching training)
+    rank_map = {
+        "vol_adj_momentum_20d_rank": "vol_adj_momentum_20d",
+        "pct_from_52w_high_rank": "pct_from_52w_high",
+        "idio_momentum_20d_rank": "idio_momentum_20d",
+    }
+    for rank_col, src_col in rank_map.items():
+        if rank_col not in inf_df.columns and src_col in inf_df.columns:
+            inf_df[rank_col] = inf_df.groupby(date_col)[src_col].rank(pct=True)
+
+    return inf_df
 
 
 def _build_inference_matrix(
@@ -287,32 +447,51 @@ def _build_inference_matrix(
         )
     )
     if needs_liquidity:
+        # Match training pipeline: use rolling 30-day average dollar volume as
+        # size proxy instead of static symbols.market_cap (forward-looking bias).
         liq_rows = db.execute(
-            text(
-                """
-            SELECT mb.symbol, mb.close, mb.volume, s.market_cap
-            FROM market_bars_daily mb
-            JOIN symbols s ON s.symbol = mb.symbol
-            WHERE mb.date = :d
-              AND s.is_active = true
-            """
-            ),
-            {"d": feature_date},
+            text("""
+                SELECT symbol, date, close, volume
+                FROM market_bars_daily
+                WHERE date BETWEEN (:d::date - INTERVAL '45 days') AND :d
+                  AND symbol = ANY(:syms)
+                ORDER BY symbol, date
+            """),
+            {
+                "d": feature_date,
+                "syms": list(inf_df["symbol"].unique()),
+            },
         ).fetchall()
         if liq_rows:
-            liq_df = pd.DataFrame(
-                liq_rows, columns=["symbol", "close", "volume", "market_cap"]
+            hist = pd.DataFrame(liq_rows, columns=["symbol", "date", "close", "volume"])
+            hist["dollar_volume"] = hist["close"].abs() * hist["volume"].abs()
+            hist = hist.sort_values(["symbol", "date"])
+
+            # Rolling 30-day average dollar volume per symbol (size proxy)
+            rolling_adv = (
+                hist.groupby("symbol")["dollar_volume"]
+                .apply(lambda x: x.rolling(30, min_periods=5).mean().iloc[-1])
             )
-            liq_df["dollar_volume"] = liq_df["close"] * liq_df["volume"]
-            liq_df["log_market_cap"] = liq_df["market_cap"].clip(lower=1).map(
-                lambda v: float(np.log(v))
+            rolling_adv = rolling_adv.clip(lower=1).rename("_pit_market_cap")
+
+            # Latest-day values for turnover ratio
+            latest = hist.groupby("symbol").tail(1).set_index("symbol")
+
+            rolling_avg_vol = (
+                hist.groupby("symbol")["volume"]
+                .apply(lambda x: x.rolling(30, min_periods=5).mean().iloc[-1])
             )
-            shares_float = (liq_df["market_cap"] / liq_df["close"].clip(lower=0.01)).clip(
-                lower=1
-            )
-            liq_df["turnover_ratio"] = liq_df["volume"] / shares_float
-            liq_df["market_cap_rank"] = liq_df["market_cap"].rank(pct=True)
-            liq_df["dollar_volume_rank_market"] = liq_df["dollar_volume"].rank(pct=True)
+
+            liq_df = pd.DataFrame({
+                "dollar_volume": latest["dollar_volume"],
+                "log_market_cap": np.log1p(rolling_adv),
+                "market_cap_rank": rolling_adv.rank(pct=True),
+                "dollar_volume_rank_market": latest["dollar_volume"].rank(pct=True),
+                "turnover_ratio": latest["volume"] / rolling_avg_vol.clip(lower=1),
+            })
+            liq_df.index.name = "symbol"
+            liq_df = liq_df.reset_index()
+
             liq_cols = [
                 "symbol",
                 "dollar_volume",
@@ -347,6 +526,9 @@ def _build_inference_matrix(
     usable_transform_cols = [c for c in transform_cols if c in inf_df.columns]
     if usable_transform_cols:
         inf_df = _add_cross_sectional_transforms(inf_df, usable_transform_cols)
+
+    # ── Alpha features not persisted in features_snapshot ──
+    inf_df = _compute_alpha_features(db, inf_df, feature_date, expected_cols)
 
     # Regime one-hot columns (e.g. regime_bull_high_vol).
     if "regime_label" in inf_df.columns:
@@ -391,10 +573,13 @@ def run_batch_predictions(
         return {"predictions": 0, "errors": 0}
 
     feature_date = snapshots_df["target_session_date"].iloc[0].date()
-    prediction_target = resolve_next_trading_day(db, feature_date)
+    meta = _load_model_metadata()
+    horizon = meta.get("target_horizon_days", 1)
+    prediction_target = resolve_nth_trading_day(db, feature_date, n=horizon)
     logger.info(
         f"Batch predict: {len(snapshots_df)} symbols, "
-        f"features_as_of={feature_date}, target={prediction_target}, model={reg.model_version}"
+        f"features_as_of={feature_date}, target={prediction_target} "
+        f"(horizon={horizon}d), model={reg.model_version}"
     )
 
     expected_cols = []
@@ -443,6 +628,11 @@ def run_batch_predictions(
         except Exception:
             logger.warning("Failed to create SHAP explainer, skipping explanations")
 
+    target_mode = _load_target_mode()
+    is_relative = target_mode in ("market_relative", "sector_relative")
+    if is_relative:
+        logger.info(f"Model target_mode={target_mode}: direction = outperform/underperform")
+
     now = datetime.now(UTC)
     predictions = []
     errors = 0
@@ -451,7 +641,10 @@ def run_batch_predictions(
         try:
             prob_up = float(cal_probs[i])
             confidence = max(prob_up, 1.0 - prob_up)
-            direction = "up" if prob_up >= 0.5 else "down"
+            if is_relative:
+                direction = "outperform" if prob_up >= 0.5 else "underperform"
+            else:
+                direction = "up" if prob_up >= 0.5 else "down"
 
             factors = []
             if explainer is not None and shap_matrix is not None and i < len(shap_matrix):

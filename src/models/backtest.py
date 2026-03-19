@@ -5,7 +5,9 @@ performance without look-ahead bias.
 """
 
 import logging
+import math
 from datetime import date, timedelta
+from scipy import stats as scipy_stats
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,88 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from src.models.trainer import DEFAULT_PARAMS, prepare_features
 
 logger = logging.getLogger(__name__)
+
+
+def compute_deflated_sharpe_ratio(
+    observed_sharpe: float,
+    n_trials: int,
+    n_observations: int,
+    skewness: float = 0.0,
+    kurtosis: float = 3.0,
+    annualization_factor: float = 1.0,
+) -> dict:
+    """Deflated Sharpe Ratio (Bailey & Lopez de Prado, 2014).
+
+    Adjusts an observed Sharpe ratio for the number of trials (strategies,
+    parameter sets, seeds) tested.  Under the null hypothesis that all
+    strategies have zero expected return, the expected maximum Sharpe from
+    N independent trials is:
+
+        E[max SR] ≈ √(2 * ln(N)) * (1 - γ / (2 * ln(N))) + γ / √(2 * ln(N))
+
+    where γ ≈ 0.5772 (Euler-Mascheroni constant).
+
+    The DSR is the probability that the observed SR exceeds this expected
+    maximum, corrected for non-normality (skewness, kurtosis) of returns.
+
+    Args:
+        observed_sharpe: Sharpe ratio to test (already annualized or not,
+            must match annualization_factor).
+        n_trials: Number of independent strategies/configs tested.
+        n_observations: Number of return observations used to estimate Sharpe.
+        skewness: Skewness of the return series.
+        kurtosis: Kurtosis of the return series (excess kurtosis + 3).
+        annualization_factor: Set to 1.0 if observed_sharpe is already
+            annualized and n_observations is the number of periods.
+
+    Returns:
+        Dict with dsr (0-1 probability), expected_max_sharpe, sharpe_std_error.
+    """
+    if n_trials < 1 or n_observations < 10:
+        return {
+            "dsr": None,
+            "expected_max_sharpe": None,
+            "sharpe_std_error": None,
+            "n_trials": n_trials,
+        }
+
+    euler_mascheroni = 0.5772156649
+
+    if n_trials == 1:
+        expected_max_sr = 0.0
+    else:
+        ln_n = math.log(n_trials)
+        sqrt_2ln = math.sqrt(2 * ln_n)
+        expected_max_sr = sqrt_2ln * (1 - euler_mascheroni / (2 * ln_n)) + \
+            euler_mascheroni / sqrt_2ln
+
+    # Standard error of the Sharpe ratio under non-normal returns
+    # (Lo, 2002; Bailey & Lopez de Prado, 2014)
+    sr = observed_sharpe / annualization_factor if annualization_factor != 1.0 else observed_sharpe
+    se_sr = math.sqrt(
+        (1 - skewness * sr + ((kurtosis - 1) / 4) * sr ** 2) / n_observations
+    )
+
+    if se_sr < 1e-12:
+        return {
+            "dsr": None,
+            "expected_max_sharpe": round(expected_max_sr * annualization_factor, 4),
+            "sharpe_std_error": 0.0,
+            "n_trials": n_trials,
+        }
+
+    # DSR = Φ((SR_observed - E[max SR]) / SE(SR))
+    z_score = (sr - expected_max_sr) / se_sr
+    dsr = float(scipy_stats.norm.cdf(z_score))
+
+    return {
+        "dsr": round(dsr, 4),
+        "expected_max_sharpe": round(expected_max_sr * annualization_factor, 4),
+        "sharpe_std_error": round(se_sr * annualization_factor, 4),
+        "dsr_z_score": round(z_score, 4),
+        "n_trials": n_trials,
+        "n_observations": n_observations,
+    }
 
 
 def walk_forward_backtest(
@@ -30,6 +114,7 @@ def walk_forward_backtest(
     rank_sharpe_nw_lag: int = 0,
     feature_profile: str = "all_features",
     rank_weight_mode: str = "equal",
+    model_mode: str = "classifier",
 ) -> dict:
     """Run walk-forward expanding-window backtest.
 
@@ -38,10 +123,22 @@ def walk_forward_backtest(
         min_train_days: Minimum trading days before first prediction
         step_days: Number of days per evaluation step
         params: XGBoost parameters
+        model_mode: "classifier", "regressor", or "ranker"
 
     Returns dict with per-step metrics and aggregate results.
     """
-    params = params or DEFAULT_PARAMS.copy()
+    from src.models.trainer import (
+        REGRESSION_PARAMS, RANKER_PARAMS, _build_ranker_groups,
+    )
+
+    if params is None:
+        if model_mode == "regressor":
+            params = REGRESSION_PARAMS.copy()
+        elif model_mode == "ranker":
+            params = RANKER_PARAMS.copy()
+        else:
+            params = DEFAULT_PARAMS.copy()
+
     df = df.sort_values("target_session_date").reset_index(drop=True)
 
     dates = sorted(df["target_session_date"].unique())
@@ -67,21 +164,54 @@ def walk_forward_backtest(
             start_idx += step_days
             continue
 
-        X_train, y_train, train_medians = prepare_features(train_df, feature_profile=feature_profile)
-        X_test, y_test, _ = prepare_features(test_df, fill_medians=train_medians, feature_profile=feature_profile)
+        X_train, y_train, train_medians = prepare_features(
+            train_df, feature_profile=feature_profile, model_mode=model_mode,
+        )
+        X_test, y_test, _ = prepare_features(
+            test_df, fill_medians=train_medians, feature_profile=feature_profile,
+            model_mode=model_mode,
+        )
 
-        common_cols = [c for c in X_train.columns if c in X_test.columns]
-        X_train = X_train[common_cols]
-        X_test = X_test[common_cols]
+        for col in X_train.columns:
+            if col not in X_test.columns:
+                X_test[col] = 0
+        X_test = X_test[X_train.columns]
 
-        model = xgb.XGBClassifier(**params)
-        model.fit(X_train, y_train, verbose=False)
+        if model_mode == "ranker":
+            model = xgb.XGBRanker(**params)
+            train_groups = _build_ranker_groups(train_df)
+            model.fit(X_train, y_train, group=train_groups, verbose=False)
+            y_scores = model.predict(X_test)
+            # Normalize scores to [0,1] for compatibility with ranking metrics
+            score_min, score_max = y_scores.min(), y_scores.max()
+            y_prob = (y_scores - score_min) / (score_max - score_min + 1e-12)
+            y_pred_binary = (y_prob > 0.5).astype(int)
+            y_actual_binary = (test_df["direction"].values[:len(y_pred_binary)]
+                               if "direction" in test_df.columns
+                               else (y_test > 0).astype(int).values)
+        elif model_mode == "regressor":
+            model = xgb.XGBRegressor(**params)
+            model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+            y_scores = model.predict(X_test)
+            # Normalize predicted returns to pseudo-probabilities for ranking metrics
+            from scipy.stats import rankdata
+            y_prob = rankdata(y_scores) / len(y_scores)
+            y_pred_binary = (y_scores > 0).astype(int)
+            y_actual_binary = (test_df["direction"].values[:len(y_pred_binary)]
+                               if "direction" in test_df.columns
+                               else (y_test > 0).astype(int).values)
+        else:
+            model = xgb.XGBClassifier(**params)
+            model.fit(X_train, y_train, verbose=False)
+            y_pred_binary = model.predict(X_test)
+            y_prob = model.predict_proba(X_test)[:, 1]
+            y_actual_binary = y_test.values
 
-        y_pred = model.predict(X_test)
-        y_prob = model.predict_proba(X_test)[:, 1]
-
-        step_acc = accuracy_score(y_test, y_pred)
-        step_auc = roc_auc_score(y_test, y_prob) if len(y_test.unique()) > 1 else 0.5
+        step_acc = float(accuracy_score(y_actual_binary, y_pred_binary))
+        step_auc = (
+            float(roc_auc_score(y_actual_binary, y_prob))
+            if len(set(y_actual_binary)) > 1 else 0.5
+        )
 
         step_results.append({
             "train_end": str(train_end),
@@ -100,8 +230,8 @@ def walk_forward_backtest(
                 "regime_label": row["regime_label"] if "regime_label" in row else None,
                 "vix_level": float(row["vix_level"]) if "vix_level" in row and pd.notna(row["vix_level"]) else np.nan,
                 "date": row["target_session_date"],
-                "actual": int(y_test.iloc[i]),
-                "predicted": int(y_pred[i]),
+                "actual": int(y_actual_binary[i]),
+                "predicted": int(y_pred_binary[i]),
                 "probability_up": float(y_prob[i]),
                 "target_value": float(row["target_value"]) if "target_value" in row and pd.notna(row["target_value"]) else np.nan,
                 "next_day_return": float(row["next_day_return"]) if "next_day_return" in row and pd.notna(row["next_day_return"]) else np.nan,
@@ -141,6 +271,13 @@ def walk_forward_backtest(
         logger.warning(
             f"LEAKAGE ALERT: Backtest accuracy {agg_metrics['overall_accuracy']:.4f} > 0.65"
         )
+
+    # Signal decay analysis: IC at multiple forward horizons
+    decay_metrics = _compute_signal_decay_curve(preds_df, df)
+    agg_metrics.update(decay_metrics)
+
+    if decay_metrics.get("signal_half_life_days"):
+        logger.info(f"  Signal half-life: {decay_metrics['signal_half_life_days']}d")
 
     return {
         "step_results": step_results,
@@ -401,6 +538,22 @@ def _compute_ranking_metrics(
         std_n = float(grp["long_short_net"].std())
         yearly_gross[str(int(yr))] = float((grp["long_short"].mean() / std_g) * annualization) if std_g > 0 else None
         yearly_net[str(int(yr))] = float((grp["long_short_net"].mean() / std_n) * annualization) if std_n > 0 else None
+    # Deflated Sharpe Ratio (Bailey & Lopez de Prado, 2014)
+    # Default n_trials=35 corresponds to 7 feature profiles × 5 seeds.
+    # Callers can override via aggregate_metrics post-processing if needed.
+    n_obs = len(ddf)
+    ls_net_arr = ddf["long_short_net"].to_numpy()
+    ls_skew = float(scipy_stats.skew(ls_net_arr)) if n_obs > 3 else 0.0
+    ls_kurt = float(scipy_stats.kurtosis(ls_net_arr, fisher=False)) if n_obs > 3 else 3.0
+    dsr_result = compute_deflated_sharpe_ratio(
+        observed_sharpe=sharpe_net_nw if sharpe_net_nw is not None else (sharpe_net or 0.0),
+        n_trials=35,
+        n_observations=n_obs,
+        skewness=ls_skew,
+        kurtosis=ls_kurt,
+        annualization_factor=annualization,
+    )
+
     return {
         "rank_long_short_mean": ls_mean,
         "rank_long_short_mean_net": ls_mean_net,
@@ -409,6 +562,8 @@ def _compute_ranking_metrics(
         "rank_long_short_sharpe_net": sharpe_net,
         "rank_long_short_sharpe_nw": sharpe_nw,
         "rank_long_short_sharpe_net_nw": sharpe_net_nw,
+        "rank_deflated_sharpe_ratio": dsr_result.get("dsr"),
+        "rank_expected_max_sharpe": dsr_result.get("expected_max_sharpe"),
         "rank_max_drawdown": max_drawdown,
         "rank_max_drawdown_net": max_drawdown_net,
         "rank_avg_turnover": avg_turnover,
@@ -791,4 +946,88 @@ def _compute_dispersion_metrics(preds_df: pd.DataFrame, rank_rebalance_stride: i
         "ic_dispersion_corr": float(ic_disp_corr) if pd.notna(ic_disp_corr) else None,
         "ic_vix_corr": float(ic_vix_corr) if pd.notna(ic_vix_corr) else None,
         "ic_vix_dispersion_curve": curve,
+    }
+
+
+def _compute_signal_decay_curve(
+    preds_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    horizons: list[int] | None = None,
+) -> dict:
+    """Compute how IC decays at different forward return horizons.
+
+    For each horizon h in horizons, computes the h-day forward return
+    for every (symbol, date) pair in preds_df, then measures the
+    cross-sectional Spearman IC between probability_up and that return.
+
+    This reveals whether the signal has a sharp peak at the trained
+    horizon and dies quickly, or whether it carries alpha out to
+    longer periods (slow decay = more robust signal).
+    """
+    if horizons is None:
+        horizons = [1, 2, 3, 5, 10, 20, 40, 60]
+
+    if "target_value" not in preds_df.columns or "probability_up" not in preds_df.columns:
+        return {"signal_decay_curve": []}
+
+    if full_df is None or "close" not in full_df.columns:
+        return {"signal_decay_curve": []}
+
+    closes = full_df[["symbol", "target_session_date", "close"]].copy()
+    closes = closes.sort_values(["symbol", "target_session_date"]).reset_index(drop=True)
+
+    preds_merge = preds_df[["symbol", "date", "probability_up"]].copy()
+    preds_merge = preds_merge.rename(columns={"date": "target_session_date"})
+
+    decay_curve = []
+
+    for h in horizons:
+        fwd_ret = (
+            closes.groupby("symbol")["close"]
+            .transform(lambda x: x.shift(-h) / x - 1)
+        )
+        closes_h = closes.copy()
+        closes_h[f"fwd_ret_{h}d"] = fwd_ret
+
+        merged = preds_merge.merge(
+            closes_h[["symbol", "target_session_date", f"fwd_ret_{h}d"]],
+            on=["symbol", "target_session_date"],
+            how="inner",
+        )
+        merged = merged.dropna(subset=[f"fwd_ret_{h}d", "probability_up"])
+
+        ics = []
+        for _, day_df in merged.groupby("target_session_date"):
+            if len(day_df) < 10:
+                continue
+            ic = day_df["probability_up"].corr(day_df[f"fwd_ret_{h}d"], method="spearman")
+            if pd.notna(ic):
+                ics.append(float(ic))
+
+        if ics:
+            ic_mean = float(np.mean(ics))
+            ic_std = float(np.std(ics, ddof=1)) if len(ics) > 1 else 0.0
+        else:
+            ic_mean = None
+            ic_std = None
+
+        decay_curve.append({
+            "horizon_days": h,
+            "ic_mean": round(ic_mean, 6) if ic_mean is not None else None,
+            "ic_std": round(ic_std, 6) if ic_std is not None else None,
+            "n_dates": len(ics),
+        })
+
+    half_life = None
+    if decay_curve and decay_curve[0]["ic_mean"] is not None:
+        peak_ic = max(abs(d["ic_mean"]) for d in decay_curve if d["ic_mean"] is not None)
+        if peak_ic > 0:
+            for point in decay_curve:
+                if point["ic_mean"] is not None and abs(point["ic_mean"]) <= peak_ic / 2:
+                    half_life = point["horizon_days"]
+                    break
+
+    return {
+        "signal_decay_curve": decay_curve,
+        "signal_half_life_days": half_life,
     }
