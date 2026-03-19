@@ -32,7 +32,7 @@ def _resolve_target_mode(db: Session, model_version: str) -> str:
     """Look up the target_mode for a given model version from model_registry."""
     row = db.execute(
         text("""
-            SELECT metadata->>'target_mode'
+            SELECT metrics->>'target_mode'
             FROM model_registry
             WHERE model_version = :v
             LIMIT 1
@@ -78,12 +78,12 @@ def backfill_realized_outcomes(
         JOIN market_bars_daily mb_target
             ON mb_target.symbol = p.symbol
             AND mb_target.date = p.target_date
-        -- Close on or just before the feature date (start of horizon)
+        -- Close BEFORE as_of_time (the feature date close the model saw)
         LEFT JOIN LATERAL (
             SELECT close
             FROM market_bars_daily
             WHERE symbol = p.symbol
-              AND date <= p.as_of_time::date
+              AND date < p.as_of_time::date
             ORDER BY date DESC
             LIMIT 1
         ) mb_base ON true
@@ -91,12 +91,12 @@ def backfill_realized_outcomes(
         LEFT JOIN market_bars_daily spy_target
             ON spy_target.symbol = 'SPY'
             AND spy_target.date = p.target_date
-        -- SPY on or just before the feature date
+        -- SPY close BEFORE as_of_time (same feature date window)
         LEFT JOIN LATERAL (
             SELECT close
             FROM market_bars_daily
             WHERE symbol = 'SPY'
-              AND date <= p.as_of_time::date
+              AND date < p.as_of_time::date
             ORDER BY date DESC
             LIMIT 1
         ) spy_base ON true

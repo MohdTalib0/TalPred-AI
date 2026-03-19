@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       start_step:
-        description: 'Start from step N (1-8, default 1)'
+        description: 'Start from step N (1-10, default 1)'
         required: false
         default: '1'
 
@@ -20,6 +20,7 @@ env:
   PREDICT_MODEL_SOURCE: "local_first"
   NEWS_INGEST_ENABLED: "0"
   NEWS_SYMBOL_LIMIT: "150"
+  STRATEGY_FRAMEWORK_ENABLED: "1"
   DATABASE_URL: ${{ secrets.DATABASE_URL }}
   REDIS_URL: ${{ secrets.REDIS_URL }}
   FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}

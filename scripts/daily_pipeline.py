@@ -1,16 +1,17 @@
 """Daily EOD pipeline orchestrator (ENG-SPEC 14).
 
 Runs the full daily pipeline in order:
- 1. Market calendar sync
- 2. Ingest market data + data quality checks
- 3. Ingest news
- 4. Ingest macro data
- 5. Feature generation
- 6. Batch predictions
- 7. Outcome backfill (realized returns)
- 8. Monitoring checks
- 9. Paper trading
-10. Ingest fundamental features (Mondays only)
+  1.  Market calendar sync
+  2.  Ingest market data + data quality checks
+  3.  Ingest news
+  4.  Ingest macro data
+  5.  Feature generation
+  6.  Batch predictions
+  7.  Outcome backfill (realized returns)
+  8.  Monitoring checks
+  9.  Paper trading monitor (subprocess — predictions + positions log)
+  9b. DB simulations (legacy + strategy framework)
+ 10.  Ingest fundamental features (Mondays only)
 
 Usage:
   python -m scripts.daily_pipeline              # run full pipeline
@@ -63,6 +64,7 @@ def step_1_calendar_sync(db):
         count = sync_calendar_to_db(db, today - timedelta(days=7), today + timedelta(days=30))
         logger.info(f"  Calendar sync complete: {count} entries")
     except Exception:
+        db.rollback()
         logger.exception("  Calendar sync failed")
 
 
@@ -94,6 +96,7 @@ def step_2_ingest_market(db):
             f"mkt_rel_outliers={len(dq_report.get('market_relative_outliers', []))})"
         )
     except Exception:
+        db.rollback()
         logger.exception("  Market ingestion failed")
 
 
@@ -223,16 +226,8 @@ def step_8_monitoring(db):
 
 
 def step_9_paper_trading(db):
-    """Run paper monitor and persist daily simulation run/trades to DB."""
-    from src.models.schema import SimulationRun
-    from src.simulation.engine import run_simulation, run_strategy_simulation
-    from src.strategies.config import StrategyFrameworkConfig
-    from src.strategies.mean_reversion import MeanReversion
-    from src.strategies.momentum_long_short import MomentumLongShort
-    from src.strategies.momentum_reversal import MomentumReversal
-    from src.strategies.sector_rotation import SectorRotation
-
-    logger.info("Step 8: Paper trading monitor")
+    """Run paper trading monitor subprocess (predictions + positions log)."""
+    logger.info("Step 9: Paper trading monitor")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "scripts.paper_trading_monitor"],
@@ -252,8 +247,20 @@ def step_9_paper_trading(db):
     except subprocess.TimeoutExpired:
         logger.warning("  Paper trading monitor timed out (180s)")
     except Exception:
-        db.rollback()
         logger.exception("  Paper trading monitor failed")
+
+
+def step_9b_db_simulations(db):
+    """Persist daily simulation runs (legacy + strategy framework) to DB."""
+    from src.models.schema import SimulationRun
+    from src.simulation.engine import run_simulation, run_strategy_simulation
+    from src.strategies.config import StrategyFrameworkConfig
+    from src.strategies.mean_reversion import MeanReversion
+    from src.strategies.momentum_long_short import MomentumLongShort
+    from src.strategies.momentum_reversal import MomentumReversal
+    from src.strategies.sector_rotation import SectorRotation
+
+    logger.info("Step 9b: DB simulations (legacy + strategies)")
 
     # ---------- Resolve eligible simulation date + model version ----------
     try:
@@ -339,7 +346,7 @@ def step_9_paper_trading(db):
         logger.exception("  Legacy simulation persistence failed")
 
     # ---------- Strategy framework simulations ----------
-    if not _as_bool_env("STRATEGY_FRAMEWORK_ENABLED", "1"):
+    if not _as_bool_env("STRATEGY_FRAMEWORK_ENABLED", default=True):
         logger.info("  Strategy framework disabled (STRATEGY_FRAMEWORK_ENABLED=0)")
         return
 
@@ -416,16 +423,17 @@ def step_10_ingest_fundamentals(db):
 
 
 STEPS = [
-    step_1_calendar_sync,
-    step_2_ingest_market,
-    step_3_ingest_news,
-    step_4_ingest_macro,
-    step_5_generate_features,
-    step_6_batch_predict,
-    step_7_outcome_backfill,
-    step_8_monitoring,
-    step_9_paper_trading,
-    step_10_ingest_fundamentals,
+    step_1_calendar_sync,       # 1
+    step_2_ingest_market,       # 2
+    step_3_ingest_news,         # 3
+    step_4_ingest_macro,        # 4
+    step_5_generate_features,   # 5
+    step_6_batch_predict,       # 6
+    step_7_outcome_backfill,    # 7
+    step_8_monitoring,          # 8
+    step_9_paper_trading,       # 9  (paper monitor subprocess)
+    step_9b_db_simulations,     # 9b (legacy + strategy DB simulations)
+    step_10_ingest_fundamentals,  # 10
 ]
 
 

@@ -3,7 +3,7 @@
 What it does each day:
   1. Loads the production model + today's feature snapshots
   2. Generates predictions for all 503 symbols
-  3. Ranks stocks: long top-20, short bottom-20
+  3. Ranks stocks: long top-10, short bottom-10
   4. Records the paper portfolio positions
   5. On subsequent days: computes realized return for yesterday's predictions
   6. Logs live IC, live Sharpe (rolling 21d), turnover, drawdown
@@ -50,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("paper_monitor")
 
-TOP_N = 20
+TOP_N = 10
 HORIZON_DAYS = 5
 ROLLING_WINDOW = 21       # days for rolling IC / Sharpe
 IC_SUSPEND_THRESHOLD = 0.01   # IC < this for 10 days → suspend
@@ -139,8 +139,8 @@ def _load_realized_returns(session_date: date, horizon: int = 5) -> pd.DataFrame
             FROM (
                 SELECT
                     symbol,
-                    FIRST_VALUE(adj_close) OVER w AS start_close,
-                    NTH_VALUE(adj_close, :h) OVER w AS end_close,
+                    FIRST_VALUE(close) OVER w AS start_close,
+                    NTH_VALUE(close, :h) OVER w AS end_close,
                     ROW_NUMBER() OVER w AS rn
                 FROM market_bars_daily
                 WHERE symbol IN (
@@ -315,13 +315,16 @@ def run_daily(session_date: date, model, train_medians, calibrator, log_df: pd.D
         if not realized.empty and "fwd_return" in realized.columns:
             merged = past_pos.merge(realized, on="symbol", how="inner").dropna(subset=["fwd_return"])
             if len(merged) >= 5:
-                # IC: rank correlation of prob_up vs fwd_return for all symbols
-                all_syms_realized = feat_df[["symbol", "prob_up"]].merge(realized, on="symbol", how="inner")
-                if len(all_syms_realized) >= 10:
-                    ic_val = float(stats.spearmanr(
-                        all_syms_realized["prob_up"],
-                        all_syms_realized["fwd_return"]
-                    ).correlation)
+                # IC: correlate the prob_up FROM THE TIME the prediction was made
+                # (stored in the positions file) with actual forward returns.
+                if "prob_up" in past_pos.columns:
+                    ic_df = past_pos[["symbol", "prob_up"]].merge(
+                        realized, on="symbol", how="inner"
+                    ).dropna(subset=["fwd_return", "prob_up"])
+                    if len(ic_df) >= 10:
+                        ic_val = float(stats.spearmanr(
+                            ic_df["prob_up"], ic_df["fwd_return"]
+                        ).correlation)
 
                 long_ret  = merged[merged["side"] == "long"]["fwd_return"].mean()
                 short_ret = merged[merged["side"] == "short"]["fwd_return"].mean()
@@ -360,8 +363,8 @@ def run_daily(session_date: date, model, train_medians, calibrator, log_df: pd.D
     if not np.isnan(long_short_net) if not (isinstance(long_short_net, float) and np.isnan(long_short_net)) else False:
         ls_series = pd.concat([ls_series, pd.Series([long_short_net])], ignore_index=True)
     ls_tail = ls_series.tail(ROLLING_WINDOW)
-    # Portfolio is rebalanced daily → annualize with sqrt(252), not sqrt(252/horizon)
-    rolling_sharpe21 = float(ls_tail.mean() / ls_tail.std() * np.sqrt(252)) if len(ls_tail) >= 5 and ls_tail.std() > 0 else np.nan
+    periods_per_year = 252 / HORIZON_DAYS
+    rolling_sharpe21 = float(ls_tail.mean() / ls_tail.std() * np.sqrt(periods_per_year)) if len(ls_tail) >= 5 and ls_tail.std() > 0 else np.nan
 
     # Cumulative return and drawdown
     all_ls = pd.to_numeric(log_df["long_short_net"], errors="coerce").dropna()
@@ -437,8 +440,9 @@ def print_report(log_df: pd.DataFrame):
     ic_vals = pd.to_numeric(log_df["ic_spearman"], errors="coerce").dropna()
 
     if len(ls_net) > 0:
-        annualised_ret = float((1 + ls_net.mean()) ** 252 - 1)
-        sharpe = float(ls_net.mean() / ls_net.std() * np.sqrt(252)) if ls_net.std() > 0 else 0
+        periods_per_year = 252 / HORIZON_DAYS
+        annualised_ret = float((1 + ls_net.mean()) ** periods_per_year - 1)
+        sharpe = float(ls_net.mean() / ls_net.std() * np.sqrt(periods_per_year)) if ls_net.std() > 0 else 0
         logger.info(f"\n  RETURNS (realized, {len(ls_net)} periods):")
         logger.info(f"    Mean net return/period:  {ls_net.mean()*100:+.2f}%")
         logger.info(f"    Annualised return:        {annualised_ret*100:+.1f}%")

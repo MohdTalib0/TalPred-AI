@@ -17,7 +17,7 @@ Portfolio policy defaults (legacy mode):
 
 import logging
 import uuid
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -40,7 +40,6 @@ def _try_build_factor_model(db: Session, end_date: date):
     """
     try:
         from src.models.factor_model import StatisticalFactorModel, build_return_matrix
-        from datetime import timedelta
 
         start = end_date - timedelta(days=400)
         symbols_result = db.execute(text(
@@ -91,11 +90,10 @@ def run_strategy_simulation(
     run_id = uuid.uuid4().hex[:16]
     risk_mgr = RiskManager(cfg.risk)
 
-    if cfg.risk.factor_constraint_enabled:
-        factor_model = _try_build_factor_model(db, end_date)
-        if factor_model is not None:
-            risk_mgr.set_factor_model(factor_model)
-            logger.info("Factor model attached to RiskManager")
+    # Factor model is rebuilt rolling inside the simulation loop (quarterly)
+    # to avoid lookahead bias — see rebalance block below.
+    _factor_rebuild_every = 63  # ~quarterly in trading days
+    _days_since_factor_build = _factor_rebuild_every  # force first build
 
     portfolio = PortfolioConstructor(
         cfg.cost, beta_neutral=cfg.beta_neutral,
@@ -154,12 +152,17 @@ def run_strategy_simulation(
     all_trades: list[dict] = []
     daily_returns: list[float] = []
     benchmark_returns: list[float] = []
+    daily_turnovers: list[float] = []
 
-    # Multi-day hold state: symbol → signed weight (positive=long, negative=short)
+    # Multi-day hold state
     current_weights: dict[str, float] = {}
+    position_values: dict[str, float] = {}   # actual dollar value (signed)
+    position_pnl: dict[str, float] = {}      # accumulated P&L per position
+    realized_position_pnls: list[float] = []
     prev_closes: dict[str, float] = {}
 
     for td in trading_dates:
+        _days_since_factor_build += 1
         day_preds = predictions_df[predictions_df["target_date"] == td].copy()
         day_features = (
             features_df[features_df["target_session_date"] == td]
@@ -171,7 +174,7 @@ def run_strategy_simulation(
 
         # ── Close-to-close P&L for existing positions ──
         hold_pnl = 0.0
-        for symbol, weight in current_weights.items():
+        for symbol in list(position_values.keys()):
             price_row = prices_df[
                 (prices_df["symbol"] == symbol) & (prices_df["date"] == td)
             ]
@@ -181,11 +184,25 @@ def run_strategy_simulation(
             yesterday_close = prev_closes.get(symbol)
             if yesterday_close and yesterday_close > 0:
                 ret = (today_close - yesterday_close) / yesterday_close
-                hold_pnl += weight * equity * ret
+                pnl = position_values[symbol] * ret
+                hold_pnl += pnl
+                position_values[symbol] += pnl
+                position_pnl[symbol] = position_pnl.get(symbol, 0.0) + pnl
 
         # ── Rebalance: compute new weights and turnover cost ──
         rebalance_cost = 0.0
         if is_rebalance:
+            # Rebuild factor model rolling to avoid lookahead bias
+            if (
+                cfg.risk.factor_constraint_enabled
+                and _days_since_factor_build >= _factor_rebuild_every
+            ):
+                factor_model = _try_build_factor_model(db, td)
+                if factor_model is not None:
+                    risk_mgr.set_factor_model(factor_model)
+                    logger.info("Factor model rebuilt as of %s", td)
+                _days_since_factor_build = 0
+
             vix = _get_vix(day_features)
             signals = strategy.generate_signals(
                 day_preds, day_features, market_df, td
@@ -201,15 +218,22 @@ def run_strategy_simulation(
 
             adv_lookup = portfolio._adv_lookup(market_df)
 
-            # Clip positions that would exceed ADV participation limits
             new_weights = portfolio.apply_partial_fills(
                 new_weights, equity, adv_lookup
             )
 
             turnover = _compute_turnover(current_weights, new_weights)
+            daily_turnovers.append(turnover)
             rebalance_cost = portfolio.compute_rebalance_cost(
                 current_weights, new_weights, equity, adv_lookup
             )
+
+            # Realize P&L for positions being closed or resized
+            for symbol in current_weights:
+                new_w = new_weights.get(symbol, 0.0)
+                if abs(new_w) < 1e-8 or abs(new_w - current_weights[symbol]) > 1e-8:
+                    if symbol in position_pnl:
+                        realized_position_pnls.append(position_pnl.pop(symbol))
 
             # Record trades for positions that changed
             for symbol in set(list(current_weights.keys()) + list(new_weights.keys())):
@@ -247,12 +271,17 @@ def run_strategy_simulation(
                 })
 
             current_weights = new_weights
+            position_values = {
+                sym: w * equity
+                for sym, w in new_weights.items()
+                if abs(w) > 1e-8
+            }
 
         # Daily borrow cost for shorts (accrued daily, not just on rebalance)
         daily_borrow = sum(
-            portfolio.cost.daily_borrow_cost(equity * abs(w))
-            for sym, w in current_weights.items()
-            if w < 0
+            portfolio.cost.daily_borrow_cost(abs(v))
+            for sym, v in position_values.items()
+            if v < 0
         )
 
         day_pnl = hold_pnl - rebalance_cost - daily_borrow
@@ -265,16 +294,24 @@ def run_strategy_simulation(
         equity_curve.append({"date": str(td), "equity": round(equity, 2)})
 
         # Update prev_closes for next day's close-to-close calculation
-        for symbol in set(list(current_weights.keys()) + list(prev_closes.keys())):
+        for symbol in set(list(position_values.keys()) + list(prev_closes.keys())):
             price_row = prices_df[
                 (prices_df["symbol"] == symbol) & (prices_df["date"] == td)
             ]
             if not price_row.empty:
                 prev_closes[symbol] = float(price_row.iloc[0]["close"])
 
+    # Realize remaining open positions for win-rate calculation
+    for symbol, pnl in position_pnl.items():
+        realized_position_pnls.append(pnl)
+
     metrics = _compute_metrics(
-        equity_curve, daily_returns, all_trades, cfg.starting_capital, benchmark_returns
+        equity_curve, daily_returns, all_trades, cfg.starting_capital, benchmark_returns,
+        realized_position_pnls=realized_position_pnls,
     )
+
+    if daily_turnovers:
+        metrics["avg_rebalance_turnover"] = round(float(np.mean(daily_turnovers)), 4)
 
     signal_health = _compute_signal_health(
         predictions_df, prices_df, trading_dates
@@ -339,9 +376,9 @@ def run_simulation(
     top_n: int = 10,
     model_version: str | None = None,
     enable_regime_guard: bool = True,
-    vix_quarter_exposure_below: float = 12.0,
-    vix_half_exposure_below: float = 15.0,
-    vix_full_exposure_above: float = 20.0,
+    vix_calm_below: float = 12.0,
+    vix_elevated_below: float = 15.0,
+    vix_stressed_above: float = 20.0,
     use_live_ic_guard: bool = False,
     live_ic_lookback_days: int = 60,
     live_ic_floor: float = 0.01,
@@ -416,9 +453,9 @@ def run_simulation(
             as_of_date=td,
             model_version=model_version,
             enable_regime_guard=enable_regime_guard,
-            vix_quarter_exposure_below=vix_quarter_exposure_below,
-            vix_half_exposure_below=vix_half_exposure_below,
-            vix_full_exposure_above=vix_full_exposure_above,
+            vix_calm_below=vix_calm_below,
+            vix_elevated_below=vix_elevated_below,
+            vix_stressed_above=vix_stressed_above,
             use_live_ic_guard=use_live_ic_guard,
             live_ic_lookback_days=live_ic_lookback_days,
             live_ic_floor=live_ic_floor,
@@ -656,7 +693,7 @@ def _load_market_window(db: Session, end_date: date, lookback: int = 60) -> pd.D
         WHERE date >= :start AND date <= :end
         ORDER BY date
     """),
-        {"start": end_date - pd.Timedelta(days=lookback * 2), "end": end_date},
+        {"start": end_date - timedelta(days=lookback * 2), "end": end_date},
     )
     rows = result.fetchall()
     if not rows:
@@ -718,38 +755,44 @@ def _compute_exposure_scale(
     as_of_date: date,
     model_version: str | None,
     enable_regime_guard: bool,
-    vix_quarter_exposure_below: float,
-    vix_half_exposure_below: float,
-    vix_full_exposure_above: float,
+    vix_calm_below: float,
+    vix_elevated_below: float,
+    vix_stressed_above: float,
     use_live_ic_guard: bool,
     live_ic_lookback_days: int,
     live_ic_floor: float,
     low_ic_exposure_scale: float,
 ) -> tuple[float, float | None]:
-    """Combine VIX-based and live-IC-based exposure controls (legacy)."""
+    """Combine VIX-based and live-IC-based exposure controls (legacy).
+
+    VIX regime mapping (standard risk-off behaviour):
+      VIX < calm_below  (12):  calm market    → full exposure  (1.00)
+      VIX < elevated    (15):  moderate       → 75% exposure
+      VIX < stressed    (20):  elevated       → 50% exposure
+      VIX >= stressed   (20):  stressed/crisis → 25% exposure
+    """
     if not enable_regime_guard:
         return 1.0, None
 
     vix_scale = 1.0
     if "vix_level" in day_preds.columns and day_preds["vix_level"].notna().any():
         vix = float(day_preds["vix_level"].median())
-        if vix < vix_quarter_exposure_below:
-            vix_scale = 0.25
-        elif vix < vix_half_exposure_below:
-            vix_scale = 0.50
-        elif vix >= vix_full_exposure_above:
+        if vix < vix_calm_below:
             vix_scale = 1.0
-        else:
+        elif vix < vix_elevated_below:
             vix_scale = 0.75
+        elif vix >= vix_stressed_above:
+            vix_scale = 0.25
+        else:
+            vix_scale = 0.50
 
-    live_ic = None
+    live_ic = _compute_live_rolling_ic(
+        db, as_of_date, live_ic_lookback_days, model_version=model_version
+    )
+
     ic_scale = 1.0
-    if use_live_ic_guard:
-        live_ic = _compute_live_rolling_ic(
-            db, as_of_date, live_ic_lookback_days, model_version=model_version
-        )
-        if live_ic is not None and live_ic < live_ic_floor:
-            ic_scale = float(min(max(low_ic_exposure_scale, 0.0), 1.0))
+    if use_live_ic_guard and live_ic is not None and live_ic < live_ic_floor:
+        ic_scale = float(min(max(low_ic_exposure_scale, 0.0), 1.0))
 
     return min(vix_scale, ic_scale), live_ic
 
@@ -763,7 +806,7 @@ def _compute_live_rolling_ic(
     """Compute trailing mean daily IC from realized predictions."""
     mv_filter = "AND model_version = :mv" if model_version else ""
     params: dict = {
-        "start": as_of_date - pd.Timedelta(days=lookback_days),
+        "start": as_of_date - timedelta(days=lookback_days),
         "end": as_of_date,
     }
     if model_version:
@@ -808,35 +851,31 @@ def _compute_signal_health(
 ) -> dict:
     """Compute daily IC, decile spread, and long-short spread.
 
-    Uses the FULL cross-section of predictions (all symbols, not just traded),
-    because signal health measures the model's ranking ability over the universe.
-
-    Returns dict with daily traces and aggregates.
+    Uses close-to-close returns (matching the strategy framework's P&L
+    definition) and the FULL cross-section of predictions, not just traded
+    symbols, because signal health measures ranking ability over the universe.
     """
     daily_ics: list[float] = []
-    daily_decile_spreads: list[float] = []
     daily_ls_spreads_bps: list[float] = []
     daily_details: list[dict] = []
+
+    prices_sorted = prices_df.sort_values(["symbol", "date"])
+    prices_sorted["prev_close"] = prices_sorted.groupby("symbol")["close"].shift(1)
+    prices_sorted["cc_return"] = (
+        (prices_sorted["close"] - prices_sorted["prev_close"])
+        / prices_sorted["prev_close"]
+    )
 
     for td in trading_dates:
         day_preds = all_preds[all_preds["target_date"] == td].copy()
         if len(day_preds) < 20:
             continue
 
-        returns_for_day = []
-        for _, pred in day_preds.iterrows():
-            price_row = prices_df[
-                (prices_df["symbol"] == pred["symbol"]) & (prices_df["date"] == td)
-            ]
-            if price_row.empty:
-                returns_for_day.append(np.nan)
-                continue
-            o = float(price_row.iloc[0]["open"])
-            c = float(price_row.iloc[0]["close"])
-            returns_for_day.append((c - o) / o if o > 0 else np.nan)
-
-        day_preds = day_preds.copy()
-        day_preds["realized_ret"] = returns_for_day
+        day_returns = prices_sorted[prices_sorted["date"] == td][
+            ["symbol", "cc_return"]
+        ]
+        day_preds = day_preds.merge(day_returns, on="symbol", how="left")
+        day_preds = day_preds.rename(columns={"cc_return": "realized_ret"})
         day_preds = day_preds.dropna(subset=["realized_ret", "probability_up"])
 
         if len(day_preds) < 20:
@@ -855,10 +894,7 @@ def _compute_signal_health(
         if len(decile_returns) >= 2:
             top_ret = float(decile_returns.iloc[-1])
             bot_ret = float(decile_returns.iloc[0])
-            spread = top_ret - bot_ret
-            daily_decile_spreads.append(spread)
-
-            ls_bps = spread * 10_000
+            ls_bps = (top_ret - bot_ret) * 10_000
             daily_ls_spreads_bps.append(ls_bps)
 
             daily_details.append({
@@ -879,8 +915,8 @@ def _compute_signal_health(
             if daily_ics and np.std(daily_ics) > 0 else None
         ),
         "decile_spread_mean_bps": (
-            round(float(np.mean(daily_decile_spreads)) * 10_000, 2)
-            if daily_decile_spreads else None
+            round(float(np.mean(daily_ls_spreads_bps)), 2)
+            if daily_ls_spreads_bps else None
         ),
         "ls_spread_mean_bps": (
             round(float(np.mean(daily_ls_spreads_bps)), 2)
@@ -928,8 +964,14 @@ def _compute_metrics(
     starting_capital: float,
     benchmark_returns: list[float] | None = None,
     nw_lag: int = 4,
+    realized_position_pnls: list[float] | None = None,
 ) -> dict:
-    """Compute simulation performance metrics with Newey-West adjusted Sharpe."""
+    """Compute simulation performance metrics with Newey-West adjusted Sharpe.
+
+    For strategy-framework simulations, trades are recorded at rebalance
+    with ``daily_pnl=0``.  In that case *realized_position_pnls* (P&L per
+    round-trip position) is used to compute a meaningful win rate.
+    """
     final_equity = equity_curve[-1]["equity"] if equity_curve else starting_capital
     total_return = (final_equity - starting_capital) / starting_capital
 
@@ -954,8 +996,12 @@ def _compute_metrics(
         dd = (peak - eq) / peak if peak > 0 else 0
         max_dd = max(max_dd, dd)
 
-    wins = sum(1 for t in trades if t["daily_pnl"] > 0)
-    total_trades = len(trades)
+    if realized_position_pnls:
+        wins = sum(1 for p in realized_position_pnls if p > 0)
+        total_trades = len(realized_position_pnls)
+    else:
+        wins = sum(1 for t in trades if t["daily_pnl"] > 0)
+        total_trades = len(trades)
     win_rate = wins / total_trades if total_trades > 0 else 0
 
     total_costs = sum(t["transaction_cost"] + t.get("slippage_cost", 0) for t in trades)
@@ -1022,8 +1068,7 @@ def _save_trades(db: Session, trades: list[dict]) -> int:
     if not trades:
         return 0
 
-    for t in trades:
-        db.add(PaperTrade(**_sanitize_trade(t)))
-
+    sanitized = [_sanitize_trade(t) for t in trades]
+    db.bulk_insert_mappings(PaperTrade, sanitized)
     db.commit()
     return len(trades)

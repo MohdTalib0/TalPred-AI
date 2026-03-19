@@ -203,7 +203,7 @@ class Prediction(Base):
     feature_snapshot_id = Column(String(128))
     dataset_version = Column(String(64))
     cache_ttl_seconds = Column(Integer, default=86400)
-    realized_direction = Column(String(10))
+    realized_direction = Column(String(20))
     realized_return = Column(Float)
     outcome_recorded_at = Column(DateTime(timezone=True))
 
