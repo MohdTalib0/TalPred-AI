@@ -20,13 +20,11 @@ from src.features.fundamentals import compute_fundamental_features
 logger = logging.getLogger(__name__)
 
 _FEATURE_COLS = [
-    "accruals_ratio", "roe_trend", "earnings_momentum",
+    "accruals", "roe_trend", "earnings_momentum",
     "revenue_surprise", "gross_margin_change", "operating_leverage",
 ]
 
-_COL_MAP = {
-    "accruals_ratio": "accruals",
-}
+_COL_MAP: dict[str, str] = {}
 
 _BATCH_SIZE = 500
 

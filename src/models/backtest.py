@@ -393,9 +393,10 @@ def _compute_sector_ranking_metrics(
         return {"sector_sharpes": {}, "sector_spreads_bps": {}, "sector_days": {}, "sector_concentration_ratio": None}
 
     valid_sharpes = [v for v in sector_sharpes.values() if v is not None]
+    mean_sharpe = float(np.mean(valid_sharpes)) if valid_sharpes else 0.0
     concentration_ratio = (
-        float(max(valid_sharpes)) / float(np.mean(valid_sharpes))
-        if valid_sharpes and np.mean(valid_sharpes) != 0 else None
+        float(max(valid_sharpes)) / mean_sharpe
+        if valid_sharpes and mean_sharpe > 0.1 else None
     )
     ranked = sorted(sector_sharpes.items(), key=lambda x: (x[1] or -999), reverse=True)
 
@@ -462,7 +463,6 @@ def _compute_ranking_metrics(
                 continue
             long_pick = pd.concat(long_parts, ignore_index=True)
             short_pick = pd.concat(short_parts, ignore_index=True)
-            top_n = len(long_pick)
         else:
             raise ValueError(f"Unsupported rank_mode: {rank_mode}")
         if rank_weight_mode == "signal":
@@ -479,10 +479,11 @@ def _compute_ranking_metrics(
             short_leg = short_pick["target_value"].mean()
         long_syms = set(long_pick["symbol"].tolist())
         short_syms = set(short_pick["symbol"].tolist())
+        effective_n = len(long_pick)
         turnover = None
-        if prev_long is not None and prev_short is not None:
-            long_turn = 1 - (len(prev_long & long_syms) / top_n)
-            short_turn = 1 - (len(prev_short & short_syms) / top_n)
+        if prev_long is not None and prev_short is not None and effective_n > 0:
+            long_turn = 1 - (len(prev_long & long_syms) / effective_n)
+            short_turn = 1 - (len(prev_short & short_syms) / effective_n)
             turnover = (long_turn + short_turn) / 2
         # Two-sided daily cost approximation: long + short turnover
         cost = ((turnover or 0.0) * 2.0) * (transaction_cost_bps / 10000.0)
@@ -539,7 +540,7 @@ def _compute_ranking_metrics(
         yearly_gross[str(int(yr))] = float((grp["long_short"].mean() / std_g) * annualization) if std_g > 0 else None
         yearly_net[str(int(yr))] = float((grp["long_short_net"].mean() / std_n) * annualization) if std_n > 0 else None
     # Deflated Sharpe Ratio (Bailey & Lopez de Prado, 2014)
-    # Default n_trials=35 corresponds to 7 feature profiles × 5 seeds.
+    # Default n_trials=40 corresponds to 8 feature profiles × 5 seeds.
     # Callers can override via aggregate_metrics post-processing if needed.
     n_obs = len(ddf)
     ls_net_arr = ddf["long_short_net"].to_numpy()
@@ -547,7 +548,7 @@ def _compute_ranking_metrics(
     ls_kurt = float(scipy_stats.kurtosis(ls_net_arr, fisher=False)) if n_obs > 3 else 3.0
     dsr_result = compute_deflated_sharpe_ratio(
         observed_sharpe=sharpe_net_nw if sharpe_net_nw is not None else (sharpe_net or 0.0),
-        n_trials=35,
+        n_trials=40,
         n_observations=n_obs,
         skewness=ls_skew,
         kurtosis=ls_kurt,
@@ -906,8 +907,7 @@ def _compute_dispersion_metrics(preds_df: pd.DataFrame, rank_rebalance_stride: i
         if len(day_df) < 10:
             continue
         ic = day_df["probability_up"].corr(day_df["target_value"], method="spearman")
-        ret_col = "next_day_return" if "next_day_return" in day_df.columns else "target_value"
-        dispersion = day_df[ret_col].std()
+        dispersion = day_df["target_value"].std()
         vix = day_df["vix_level"].median() if "vix_level" in day_df.columns and day_df["vix_level"].notna().any() else np.nan
         rows.append({
             "date": pd.Timestamp(dt),
@@ -971,6 +971,7 @@ def _compute_signal_decay_curve(
         return {"signal_decay_curve": []}
 
     if full_df is None or "close" not in full_df.columns:
+        logger.warning("Signal decay curve unavailable: 'close' column not in df")
         return {"signal_decay_curve": []}
 
     closes = full_df[["symbol", "target_session_date", "close"]].copy()

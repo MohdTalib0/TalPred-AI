@@ -200,6 +200,7 @@ class Prediction(Base):
     confidence = Column(Float, nullable=False)
     top_factors = Column(JSONB)
     model_version = Column(String(20))
+    # Intentionally no ForeignKey — snapshots may be cleaned up independently
     feature_snapshot_id = Column(String(128))
     dataset_version = Column(String(64))
     cache_ttl_seconds = Column(Integer, default=86400)
@@ -227,6 +228,12 @@ class SimulationRun(Base):
 
 
 class PaperTrade(Base):
+    """Single trade record per (run, date, symbol).
+
+    Current simulations emit at most one weight-change per symbol per
+    rebalance day.  If a future strategy produces multiple legs for the
+    same symbol on the same date, add a sequence column to the PK.
+    """
     __tablename__ = "paper_trades"
 
     run_id = Column(String(64), primary_key=True)

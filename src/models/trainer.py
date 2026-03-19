@@ -25,7 +25,7 @@ _NEWS_FEATURES = [
 
 _FUNDAMENTAL_FEATURES = [
     "sue", "revenue_surprise", "gross_margin_change",
-    "operating_leverage", "accruals_ratio",
+    "operating_leverage", "accruals",
 ]
 
 _CORE_FEATURES = [
@@ -52,6 +52,7 @@ _CORE_FEATURES = [
     "turnover_acceleration",
     "volume_acceleration_resid", "signed_volume_proxy_resid", "turnover_acceleration_resid",
     "vix_level",
+    "sp500_momentum_200d",
 ]
 
 FEATURE_COLS = _CORE_FEATURES + _NEWS_FEATURES + _FUNDAMENTAL_FEATURES
@@ -252,6 +253,13 @@ def prepare_features(
     feature_cols = FEATURE_PROFILES[feature_profile] + extra_cols
     available = [c for c in feature_cols if c in df.columns]
 
+    dropped = [c for c in feature_cols if c not in df.columns and c not in extra_cols]
+    if dropped:
+        logger.warning(
+            "Feature profile '%s': %d/%d features not in df (dropped): %s",
+            feature_profile, len(dropped), len(feature_cols), dropped,
+        )
+
     X = df[available].copy()
 
     if model_mode in ("regressor", "ranker"):
@@ -280,6 +288,31 @@ def _build_ranker_groups(df: pd.DataFrame, date_col: str = "target_session_date"
     """Build group sizes array for XGBRanker (stocks per date)."""
     groups = df.groupby(date_col).size().values
     return groups.astype(int)
+
+
+def _daily_mean_ic(
+    df_val: pd.DataFrame, y_scores: np.ndarray, date_col: str = "target_session_date"
+) -> float:
+    """Compute daily-mean Spearman IC (score vs actual) grouped by date.
+
+    Pooling all dates into one correlation lets volatile days dominate.
+    This matches the IC definition used in simulation and monitoring.
+    """
+    if date_col not in df_val.columns:
+        return float(pd.Series(y_scores).corr(
+            pd.Series(df_val.iloc[:, -1].values), method="spearman"
+        ))
+    tmp = df_val[[date_col]].copy()
+    tmp["_score"] = y_scores
+    tmp["_actual"] = df_val["target_value"].values if "target_value" in df_val.columns else 0.0
+    daily_ics: list[float] = []
+    for _, grp in tmp.groupby(date_col):
+        if len(grp) < 10:
+            continue
+        ic = grp["_score"].corr(grp["_actual"], method="spearman")
+        if pd.notna(ic):
+            daily_ics.append(float(ic))
+    return float(np.mean(daily_ics)) if daily_ics else 0.0
 
 
 def train_baseline(
@@ -372,8 +405,7 @@ def train_baseline(
             )
             y_scores = model.predict(X_val)
 
-            # For ranking, compute Spearman IC as primary metric
-            val_ic = float(pd.Series(y_scores).corr(pd.Series(y_val.values), method="spearman"))
+            val_ic = _daily_mean_ic(df_val, y_scores)
             metrics = {
                 "val_ic": val_ic,
                 "val_mean_score": float(np.mean(y_scores)),
@@ -390,7 +422,7 @@ def train_baseline(
             y_scores = model.predict(X_val)
 
             from sklearn.metrics import mean_squared_error, mean_absolute_error
-            val_ic = float(pd.Series(y_scores).corr(pd.Series(y_val.values), method="spearman"))
+            val_ic = _daily_mean_ic(df_val, y_scores)
             rmse = float(np.sqrt(mean_squared_error(y_val, y_scores)))
 
             # Binary metrics for comparability with classifier

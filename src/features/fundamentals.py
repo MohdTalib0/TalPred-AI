@@ -198,7 +198,7 @@ def compute_fundamental_features(
       2. Legacy SimFin format: dict with 'pl', 'bs', 'cf' keys
 
     Returns DataFrame indexed by (symbol, report_date) with features:
-      - accruals_ratio: (net_income - op_cash_flow) / total_assets
+      - accruals: (net_income - op_cash_flow) / total_assets
       - roe_trend: Δ(net_income / equity) over 4 quarters
       - earnings_momentum: (EPS_q - EPS_{q-4}) / |EPS_{q-4}|
       - revenue_surprise: QoQ revenue growth
@@ -283,7 +283,7 @@ def _compute_from_unified(df: pd.DataFrame) -> pd.DataFrame:
 
             # Accruals ratio [Sloan 1996]
             if _all_valid(ni, cfo, ta) and ta != 0:
-                feature_row["accruals_ratio"] = (ni - cfo) / abs(ta)
+                feature_row["accruals"] = (ni - cfo) / abs(ta)
 
             # ROE trend: Δ(NI/equity) over last 4 quarters
             if idx >= 4:
@@ -469,12 +469,12 @@ def _compute_from_simfin_legacy(
                             and abs((pd.Timestamp(f["report_date"]) - pd.Timestamp(cf_date)).days) < 45
                         ]
                         if matched:
-                            matched[-1]["accruals_ratio"] = accrual
+                            matched[-1]["accruals"] = accrual
                         else:
                             features_list.append({
                                 "symbol": symbol,
                                 "report_date": cf_date,
-                                "accruals_ratio": accrual,
+                                "accruals": accrual,
                             })
 
     return _finalize_features(features_list)
