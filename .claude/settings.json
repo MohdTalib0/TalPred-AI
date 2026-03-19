@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(find 'c:\\\\Users\\\\moham\\\\Downloads\\\\Project-TalPred AI' -name .env.example -o -name *.env*)",
-      "Bash(grep -n \"factor_constraint_enabled\\\\|set_factor_model\" src/strategies/*.py)"
+      "Bash(grep -n \"factor_constraint_enabled\\\\|set_factor_model\" src/strategies/*.py)",
+      "Bash(find 'c:\\\\Users\\\\moham\\\\Downloads\\\\Project-TalPred AI/dashboard-react' -maxdepth 3 -type f ! -path */node_modules/*)",
+      "Bash(grep -r \"tailwind\\\\|bootstrap\\\\|material-ui\\\\|ant\\\\|svelte\\\\|vue\" 'c:\\\\Users\\\\moham\\\\Downloads\\\\Project-TalPred AI' --include=*.json --include=*.config.* --include=*.toml)"
     ]
   }
 }

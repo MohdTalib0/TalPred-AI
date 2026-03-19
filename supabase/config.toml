@@ -1,2 +1,14 @@
 [functions.dashboard-data]
 verify_jwt = false
+
+[functions.dashboard-core]
+verify_jwt = false
+
+[functions.dashboard-predictions]
+verify_jwt = false
+
+[functions.dashboard-simulation]
+verify_jwt = false
+
+[functions.dashboard-market]
+verify_jwt = false
