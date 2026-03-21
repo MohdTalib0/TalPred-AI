@@ -266,6 +266,7 @@ python -m scripts.prod_diagnostics
 | `PREDICT_MODEL_SOURCE` | `local_first`, `mlflow_first` | `mlflow_first` |
 | `BATCH_PREDICT_EXPLANATIONS` | `0`, `1` | `1` |
 | `STRATEGY_FRAMEWORK_ENABLED` | `0`, `1` | `1` |
+| `SIM_FORCE_RERUN` | `0`, `1` (`1` = delete prior Step 9b runs for date + prod model, then re-run) | `0` |
 | `PYTHONIOENCODING` | `utf-8` | (set for Windows) |
 
 ## Training Pipeline

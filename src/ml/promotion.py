@@ -13,7 +13,7 @@ import hashlib
 import logging
 from datetime import UTC, date, datetime
 
-from sqlalchemy import text
+from sqlalchemy import desc, nulls_last, text
 from sqlalchemy.orm import Session
 
 from src.models.schema import CalibrationModel, ModelRegistry
@@ -439,11 +439,11 @@ def promote_model(
 
 
 def get_production_model(db: Session) -> ModelRegistry | None:
-    """Get the current production model."""
+    """Get the current production model (most recently promoted if multiple)."""
     return (
         db.query(ModelRegistry)
         .filter(ModelRegistry.status == "production")
-        .order_by(ModelRegistry.created_at.desc())
+        .order_by(nulls_last(desc(ModelRegistry.promoted_at)), desc(ModelRegistry.created_at))
         .first()
     )
 

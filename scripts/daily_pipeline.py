@@ -11,6 +11,9 @@ Runs the full daily pipeline in order:
   8.  Monitoring checks
   9.  Paper trading monitor (subprocess — predictions + positions log)
   9b. DB simulations (legacy + strategy framework)
+      Uses model_registry production model_version (not majority vote in predictions).
+      SIM_FORCE_RERUN=1: delete existing simulation_runs + paper_trades for that
+      date/model and re-run (use after promoting a new model).
  10.  Ingest fundamental features (Mondays only)
 
 Usage:
@@ -32,6 +35,7 @@ from sqlalchemy import text
 load_dotenv()
 
 from src.db import SessionLocal  # noqa: E402
+from src.ml.promotion import get_production_model  # noqa: E402
 from src.models.schema import Symbol  # noqa: E402
 
 logging.basicConfig(
@@ -250,6 +254,38 @@ def step_9_paper_trading(db):
         logger.exception("  Paper trading monitor failed")
 
 
+def _delete_sim_runs_for_rerun(
+    db,
+    sim_date: date,
+    model_version: str,
+    strategy_names: list[str],
+) -> int:
+    """Remove prior runs (and trades) so simulations can be re-inserted."""
+    from src.models.schema import PaperTrade, SimulationRun
+
+    rows = (
+        db.query(SimulationRun)
+        .filter(
+            SimulationRun.start_date == sim_date,
+            SimulationRun.end_date == sim_date,
+            SimulationRun.model_version == model_version,
+            SimulationRun.strategy_name.in_(strategy_names),
+        )
+        .all()
+    )
+    run_ids = [r.run_id for r in rows]
+    if not run_ids:
+        return 0
+    db.query(PaperTrade).filter(PaperTrade.run_id.in_(run_ids)).delete(
+        synchronize_session=False
+    )
+    db.query(SimulationRun).filter(SimulationRun.run_id.in_(run_ids)).delete(
+        synchronize_session=False
+    )
+    db.commit()
+    return len(run_ids)
+
+
 def step_9b_db_simulations(db):
     """Persist daily simulation runs (legacy + strategy framework) to DB."""
     from src.models.schema import SimulationRun
@@ -262,37 +298,58 @@ def step_9b_db_simulations(db):
 
     logger.info("Step 9b: DB simulations (legacy + strategies)")
 
-    # ---------- Resolve eligible simulation date + model version ----------
+    # ---------- Resolve production model + eligible simulation date ----------
     try:
+        prod = get_production_model(db)
+        if not prod or not prod.model_version:
+            logger.warning(
+                "  DB simulation skipped: no production model in model_registry"
+            )
+            return
+
+        model_version = prod.model_version
+
+        # Latest target_date that has both market close data and PROD model predictions
         sim_date = db.execute(
             text("""
                 SELECT MAX(p.target_date)
                 FROM predictions p
-                WHERE p.target_date <= :today
+                WHERE p.model_version = :mv
+                  AND p.target_date <= :today
                   AND EXISTS (
                       SELECT 1
                       FROM market_bars_daily mb
                       WHERE mb.date = p.target_date
                   )
             """),
-            {"today": date.today()},
+            {"today": date.today(), "mv": model_version},
         ).scalar()
 
         if not sim_date:
-            logger.info("  DB simulation skipped: no eligible target_date available")
+            logger.info(
+                "  DB simulation skipped: no eligible target_date with predictions "
+                "for production model_version=%s (run batch predict after promoting)",
+                model_version,
+            )
             return
 
-        model_version = db.execute(
-            text("""
-                SELECT model_version
-                FROM predictions
-                WHERE target_date = :td
-                GROUP BY model_version
-                ORDER BY COUNT(*) DESC, MAX(as_of_time) DESC
-                LIMIT 1
-            """),
-            {"td": sim_date},
-        ).scalar()
+        logger.info(
+            "  Using production model_version=%s for sim_date=%s",
+            model_version,
+            sim_date,
+        )
+
+        all_strategies = [
+            "legacy_confidence_weighted",
+            "momentum_long_short",
+            "sector_rotation",
+            "mean_reversion",
+            "momentum_reversal",
+        ]
+        if _as_bool_env("SIM_FORCE_RERUN", default=False):
+            n = _delete_sim_runs_for_rerun(db, sim_date, model_version, all_strategies)
+            logger.info("  SIM_FORCE_RERUN: removed %d prior simulation row(s)", n)
+
     except Exception:
         db.rollback()
         logger.exception("  DB simulation date resolution failed")
