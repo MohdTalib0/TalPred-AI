@@ -206,7 +206,7 @@ class Prediction(Base):
     symbol = Column(String(20), nullable=False)
     as_of_time = Column(DateTime(timezone=True), nullable=False)
     target_date = Column(Date, nullable=False)
-    direction = Column(String(10), nullable=False)
+    direction = Column(String(20), nullable=False)
     probability_up = Column(Float, nullable=False)
     confidence = Column(Float, nullable=False)
     top_factors = Column(JSONB)
