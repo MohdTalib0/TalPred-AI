@@ -460,7 +460,7 @@ def _build_inference_matrix(
             text("""
                 SELECT symbol, date, close, volume
                 FROM market_bars_daily
-                WHERE date BETWEEN (:d::date - INTERVAL '45 days') AND :d
+                WHERE date BETWEEN (CAST(:d AS date) - INTERVAL '45 days') AND :d
                   AND symbol = ANY(:syms)
                 ORDER BY symbol, date
             """),

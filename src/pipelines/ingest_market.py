@@ -459,7 +459,7 @@ def _quarantine_stats(db: Session, lookback_days: int) -> dict:
     """Summarize recent quarantine entries by failure reason."""
     result = db.execute(text("""
         SELECT failure_reason, COUNT(*) as cnt
-        FROM quarantine_records
+        FROM quarantine
         WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '1 day' * :lookback
           AND source = 'market_bars_daily'
         GROUP BY failure_reason

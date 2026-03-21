@@ -201,7 +201,7 @@ def load_pit_universe(db: Session, as_of_date: date) -> list[str]:
               AND EXISTS (
                   SELECT 1 FROM market_bars_daily mb
                   WHERE mb.symbol = s.symbol
-                    AND mb.date BETWEEN (:d::date - INTERVAL '10 days') AND (:d::date + INTERVAL '10 days')
+                    AND mb.date BETWEEN (CAST(:d AS date) - INTERVAL '10 days') AND (CAST(:d AS date) + INTERVAL '10 days')
               )
         """),
         {"d": as_of_date},

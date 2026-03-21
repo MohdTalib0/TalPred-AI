@@ -139,12 +139,8 @@ def run_strategy_simulation(
     rebalance_dates = set(trading_dates[:: cfg.rebalance.stride_days])
 
     logger.info(
-        "Simulation %s [%s]: %d trading days, %d rebalance days, capital=$%,.0f",
-        run_id,
-        strategy.name,
-        len(trading_dates),
-        len(rebalance_dates),
-        cfg.starting_capital,
+        f"Simulation {run_id} [{strategy.name}]: {len(trading_dates)} trading days, "
+        f"{len(rebalance_dates)} rebalance days, capital=${cfg.starting_capital:,.0f}"
     )
 
     equity = cfg.starting_capital
@@ -419,10 +415,8 @@ def run_simulation(
 
     trading_dates = sorted(predictions_df["target_date"].unique())
     logger.info(
-        "Simulation %s [legacy]: %d trading days, capital=$%,.0f",
-        run_id,
-        len(trading_dates),
-        starting_capital,
+        f"Simulation {run_id} [legacy]: {len(trading_dates)} trading days, "
+        f"capital=${starting_capital:,.0f}"
     )
 
     equity = starting_capital
