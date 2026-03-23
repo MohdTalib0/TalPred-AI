@@ -88,7 +88,11 @@ jobs:
                   print("Fix DATABASE_URL secret using Supabase -> Database -> Connection pooling -> URI.")
                   sys.exit(1)
           elif host.startswith("db.") and host.endswith(".supabase.co"):
-              print("ERROR: Direct Supabase host is IPv6-only for this project. Use pooler host on port 6543.")
+              print("ERROR: Host db.*.supabase.co is the DIRECT DB (IPv6-only on GitHub runners).")
+              print("       Port 6543 alone is not enough — you need the TRANSACTION POOLER hostname.")
+              print("       Supabase Dashboard → Project Settings → Database → Connection string →")
+              print("       URI → Transaction pooler (host like aws-0-<region>.pooler.supabase.com).")
+              print("       User must be postgres.<project-ref>, not plain postgres.")
               sys.exit(1)
 
           if port != 6543:
