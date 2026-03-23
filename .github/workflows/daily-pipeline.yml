@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       start_step:
-        description: 'Start from step N (1-10, default 1)'
+        description: 'Start from step N (1-11; 10=9b sims, 11=fundamentals, default 1)'
         required: false
         default: '1'
 

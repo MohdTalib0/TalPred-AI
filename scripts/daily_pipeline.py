@@ -20,6 +20,7 @@ Runs the full daily pipeline in order:
 Usage:
   python -m scripts.daily_pipeline              # run full pipeline
   python -m scripts.daily_pipeline --step 6     # run from step 6 onwards
+  python -m scripts.daily_pipeline --step 11   # fundamentals only (steps 1-9b are 1-10)
 """
 
 import argparse
@@ -531,14 +532,19 @@ STEPS = [
     step_7_outcome_backfill,    # 7
     step_8_monitoring,          # 8
     step_9_paper_trading,       # 9  (paper monitor subprocess)
-    step_9b_db_simulations,     # 9b (legacy + strategy DB simulations)
-    step_10_ingest_fundamentals,  # 10
+    step_9b_db_simulations,     # 10 (--step 10; legacy + strategy DB simulations)
+    step_10_ingest_fundamentals,  # 11 (--step 11; fundamentals)
 ]
 
 
 def main():
     parser = argparse.ArgumentParser(description="Daily EOD pipeline")
-    parser.add_argument("--step", type=int, default=1, help="Start from this step (1-10)")
+    parser.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="Start from this step index (1-11). Step 10=9b simulations, 11=fundamentals.",
+    )
     args = parser.parse_args()
 
     db = SessionLocal()

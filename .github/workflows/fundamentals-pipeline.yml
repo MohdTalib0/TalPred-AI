@@ -109,11 +109,11 @@ jobs:
           pip install -r requirements.txt
           pip install lxml scipy
 
-      - name: Run fundamentals ingest (step 10 only)
+      - name: Run fundamentals ingest only (CLI --step 11; step 10 is 9b simulations)
         env:
           # Only set on workflow_dispatch; scheduled runs omit override (Monday-only).
           FUNDAMENTALS_FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_run == 'true' && '1' || '0' }}
-        run: python -m scripts.daily_pipeline --step 10
+        run: python -m scripts.daily_pipeline --step 11
 
       - name: Write job summary
         if: always()

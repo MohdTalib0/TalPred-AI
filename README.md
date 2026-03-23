@@ -181,10 +181,19 @@ supabase/functions/          # Edge function backend
 ## Scheduled Workflows
 
 - **Daily EOD:** `.github/workflows/daily-pipeline.yml` — Cron: `30 1 * * 1-5` (01:30 UTC, Mon-Fri). **Does not** run the heavy fundamentals upsert in GitHub Actions (keeps the job within the 90-minute budget).
-- **Weekly fundamentals:** `.github/workflows/fundamentals-pipeline.yml` — Cron: `0 3 * * 1` (Monday 03:00 UTC), step 10 only, **6-hour** timeout. Sets `FUNDAMENTALS_INGEST_IN_CI=1`. **Run workflow** manually with **force_run** if you need a recovery run on a non-Monday.
+- **Weekly fundamentals:** `.github/workflows/fundamentals-pipeline.yml` — Cron: `0 3 * * 1` (Monday 03:00 UTC), **`--step 11` only** (fundamentals; step 10 in the CLI is 9b simulations), **6-hour** timeout. Sets `FUNDAMENTALS_INGEST_IN_CI=1`. **Run workflow** manually with **force_run** if you need a recovery run on a non-Monday.
 - **Monthly Archive:** `.github/workflows/monthly-archive.yml` — Cron: `15 3 2 * *` (03:15 UTC, day 2)
 
-For a **full fundamentals refresh** from your machine (same as CI): `FUNDAMENTALS_INGEST_IN_CI=1 python -m scripts.daily_pipeline --step 10` on a Monday (or set `PIPELINE_CALENDAR_TZ`).
+For a **full fundamentals refresh** from your machine (same as CI): `FUNDAMENTALS_INGEST_IN_CI=1 python -m scripts.daily_pipeline --step 11` on a Monday (or set `PIPELINE_CALENDAR_TZ`). Use `--step 10` if you also want **9b DB simulations** in the same run.
+
+### GitHub Actions + Supabase `DATABASE_URL`
+
+You **do not** need to buy IPv6 or “Dedicated IPv4” from Supabase for GitHub CI. The direct host `db.<project>.supabase.co` is **IPv6-oriented** from GitHub’s runners — **changing the port to 5432 does not fix that** if the hostname is still `db.*.supabase.co`.
+
+**What works on Actions (free):** use the **Transaction pooler** string from the dashboard — host like `aws-0-<region>.pooler.supabase.com`, port **6543**, user **`postgres.<project-ref>`** (not plain `postgres`).  
+**Supabase:** Project Settings → Database → Connection string → **URI** → **Transaction pooler** → paste into the `DATABASE_URL` secret.
+
+Locally you can keep using direct or pooler; for CI, use the pooler URI.
 
 ## Local Setup
 
