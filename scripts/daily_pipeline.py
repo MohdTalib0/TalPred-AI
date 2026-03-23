@@ -14,7 +14,8 @@ Runs the full daily pipeline in order:
       Uses model_registry production model_version (not majority vote in predictions).
       SIM_FORCE_RERUN=1: delete existing simulation_runs + paper_trades for that
       date/model and re-run (use after promoting a new model).
- 10.  Ingest fundamental features (Mondays only)
+ 10.  Ingest fundamental features (Mondays only; see PIPELINE_CALENDAR_TZ / local time)
+      Skipped in GitHub Actions unless FUNDAMENTALS_INGEST_IN_CI=1 (fundamentals-pipeline.yml).
 
 Usage:
   python -m scripts.daily_pipeline              # run full pipeline
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import time
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from sqlalchemy import text
@@ -50,6 +52,37 @@ def _as_bool_env(name: str, default: bool = False) -> bool:
     if val is None:
         return default
     return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _pipeline_today_weekday() -> int:
+    """Weekday for pipeline 'is it Monday?' checks (0=Monday).
+
+    If PIPELINE_CALENDAR_TZ is set (e.g. America/New_York), use it.
+    Otherwise: GitHub Actions defaults to UTC; local runs use system local time.
+    """
+    tz_name = (os.getenv("PIPELINE_CALENDAR_TZ") or "").strip()
+    if tz_name:
+        try:
+            return datetime.now(ZoneInfo(tz_name)).weekday()
+        except Exception:
+            pass
+    if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true":
+        return datetime.now(ZoneInfo("UTC")).weekday()
+    return datetime.today().weekday()
+
+
+def _fundamentals_ingest_allowed_in_ci() -> bool:
+    """Heavy fundamentals ingest is off in GitHub Actions unless explicitly enabled."""
+    if os.getenv("GITHUB_ACTIONS", "").strip().lower() != "true":
+        return True
+    return _as_bool_env("FUNDAMENTALS_INGEST_IN_CI", default=False)
+
+
+def _should_run_fundamentals_today() -> bool:
+    """Monday gate for fundamentals, unless FUNDAMENTALS_FORCE_RUN=1 (e.g. manual recovery)."""
+    if _as_bool_env("FUNDAMENTALS_FORCE_RUN", default=False):
+        return True
+    return _pipeline_today_weekday() == 0
 
 
 def _get_active_symbols(db) -> list[str]:
@@ -462,14 +495,23 @@ def step_9b_db_simulations(db):
 
 def step_10_ingest_fundamentals(db):
     """Ingest fundamental features (SEC EDGAR / yfinance / SimFin). Monday only."""
-    if datetime.today().weekday() != 0:
-        logger.info("Step 10: Skipping fundamentals (not Monday)")
+    if not _should_run_fundamentals_today():
+        logger.info(
+            "Step 10: Skipping fundamentals (not Monday — set FUNDAMENTALS_FORCE_RUN=1 to override)"
+        )
+        return
+    if not _fundamentals_ingest_allowed_in_ci():
+        logger.info(
+            "Step 10: Skipping fundamentals in GitHub Actions "
+            "(set FUNDAMENTALS_INGEST_IN_CI=1 or run .github/workflows/fundamentals-pipeline.yml)"
+        )
         return
     from src.pipelines.ingest_fundamentals import ingest_fundamentals
     logger.info("Step 10: Ingesting fundamental features")
     try:
         symbols = _get_active_symbols(db)
-        result = ingest_fundamentals(db, symbols, lookback_years=2)
+        lookback = max(1, int(os.getenv("FUNDAMENTAL_LOOKBACK_YEARS", "2")))
+        result = ingest_fundamentals(db, symbols, lookback_years=lookback)
         logger.info(
             f"  Fundamentals complete: {result['upserted']} upserted, "
             f"{result['symbols_covered']} symbols, {result['skipped']} skipped"

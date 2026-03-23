@@ -180,8 +180,11 @@ supabase/functions/          # Edge function backend
 
 ## Scheduled Workflows
 
-- **Daily EOD:** `.github/workflows/daily-pipeline.yml` — Cron: `30 1 * * 1-5` (01:30 UTC, Mon-Fri)
+- **Daily EOD:** `.github/workflows/daily-pipeline.yml` — Cron: `30 1 * * 1-5` (01:30 UTC, Mon-Fri). **Does not** run the heavy fundamentals upsert in GitHub Actions (keeps the job within the 90-minute budget).
+- **Weekly fundamentals:** `.github/workflows/fundamentals-pipeline.yml` — Cron: `0 3 * * 1` (Monday 03:00 UTC), step 10 only, **6-hour** timeout. Sets `FUNDAMENTALS_INGEST_IN_CI=1`. **Run workflow** manually with **force_run** if you need a recovery run on a non-Monday.
 - **Monthly Archive:** `.github/workflows/monthly-archive.yml` — Cron: `15 3 2 * *` (03:15 UTC, day 2)
+
+For a **full fundamentals refresh** from your machine (same as CI): `FUNDAMENTALS_INGEST_IN_CI=1 python -m scripts.daily_pipeline --step 10` on a Monday (or set `PIPELINE_CALENDAR_TZ`).
 
 ## Local Setup
 

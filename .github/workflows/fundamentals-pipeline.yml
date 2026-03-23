@@ -1,26 +1,24 @@
-name: Daily EOD Pipeline
+# Heavy fundamentals upsert (~tens of thousands of rows). Kept separate from the 90-min
+# daily EOD workflow so this job can use a long timeout and not block the rest of the pipeline.
+name: Weekly Fundamentals Ingest
 
 on:
   schedule:
-    # 9:30 PM ET = 01:30 UTC (Mon-Fri)
-    # yfinance EOD data typically available ~30 min after close
-    - cron: '30 1 * * 1-5'
+    # Monday 03:00 UTC — after daily EOD (01:30 UTC); adjust if you change PIPELINE_CALENDAR_TZ
+    - cron: '0 3 * * 1'
   workflow_dispatch:
     inputs:
-      start_step:
-        description: 'Start from step N (1-10, default 1)'
+      force_run:
+        description: 'Run even if not Monday (recovery)'
         required: false
-        default: '1'
+        default: false
+        type: boolean
 
 env:
   PYTHONIOENCODING: utf-8
-  MARKET_INGEST_WORKERS: "8"
-  MARKET_INGEST_LOOKBACK_DAYS: "3"
-  BATCH_PREDICT_EXPLANATIONS: "0"
-  PREDICT_MODEL_SOURCE: "local_first"
-  NEWS_INGEST_ENABLED: "0"
-  NEWS_SYMBOL_LIMIT: "150"
-  STRATEGY_FRAMEWORK_ENABLED: "1"
+  FUNDAMENTALS_INGEST_IN_CI: "1"
+  PIPELINE_CALENDAR_TZ: UTC
+  FUNDAMENTAL_LOOKBACK_YEARS: "2"
   DATABASE_URL: ${{ secrets.DATABASE_URL }}
   REDIS_URL: ${{ secrets.REDIS_URL }}
   FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
@@ -30,13 +28,12 @@ env:
   MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
   MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
   MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
-
-# Step 10 (bulk fundamentals upsert) is skipped in Actions by default; see fundamentals-pipeline.yml.
+  SIMFIN_API_KEY: ${{ secrets.SIMFIN_API_KEY }}
 
 jobs:
-  daily-pipeline:
+  fundamentals:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 360
 
     steps:
       - name: Force IPv4 DNS resolution (GH Actions runners lack IPv6 connectivity)
@@ -45,7 +42,6 @@ jobs:
           sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
           sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=1
           echo "precedence ::ffff:0:0/96 100" | sudo tee -a /etc/gai.conf
-          # Pin Supabase hostname to its IPv4 address
           IPV4=$(dig +short A db.lyokdqqwlunyicwbrqny.supabase.co | head -1)
           if [ -n "$IPV4" ]; then
             echo "$IPV4 db.lyokdqqwlunyicwbrqny.supabase.co" | sudo tee -a /etc/hosts
@@ -54,8 +50,6 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
@@ -111,49 +105,16 @@ jobs:
           pip install -r requirements.txt
           pip install lxml scipy
 
-      - name: Run daily pipeline
-        run: |
-          STEP="${{ github.event.inputs.start_step || '1' }}"
-          echo "Starting from step $STEP"
-          python -m scripts.daily_pipeline --step "$STEP"
-
-      - name: Commit paper trading results
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add artifacts/paper_trading/ || true
-          if git diff --cached --quiet; then
-            echo "No paper trading changes to commit"
-          else
-            git commit -m "paper trading: $(date -u +%Y-%m-%d) daily update
-
-          Automated daily paper trading log and position update."
-            git push
-          fi
-
-      - name: Print paper trading dashboard
-        if: always()
-        run: python -m scripts.paper_trading_monitor --report-only
+      - name: Run fundamentals ingest (step 10 only)
+        env:
+          # Only set on workflow_dispatch; scheduled runs omit override (Monday-only).
+          FUNDAMENTALS_FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_run == 'true' && '1' || '0' }}
+        run: python -m scripts.daily_pipeline --step 10
 
       - name: Write job summary
         if: always()
         run: |
-          echo "## Daily Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## Fundamentals ingest" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Date:** $(date -u +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
           echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f artifacts/paper_trading/daily_log.csv ]; then
-            DAYS=$(wc -l < artifacts/paper_trading/daily_log.csv)
-            DAYS=$((DAYS - 1))
-            echo "**Paper trading days logged:** $DAYS" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "<details><summary>Latest entries</summary>" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -5 artifacts/paper_trading/daily_log.csv >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "</details>" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "No paper trading data yet." >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "**Timezone:** PIPELINE_CALENDAR_TZ=$PIPELINE_CALENDAR_TZ (Monday = weekday 0 in that zone)" >> $GITHUB_STEP_SUMMARY
