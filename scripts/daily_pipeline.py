@@ -86,6 +86,13 @@ def _should_run_fundamentals_today() -> bool:
     return _pipeline_today_weekday() == 0
 
 
+def _cli_step_label(i: int) -> str:
+    """Human label matching --step (1-11): index 10 is 9b, 11 is fundamentals."""
+    if i == 10:
+        return "9b"
+    return str(i)
+
+
 def _get_active_symbols(db) -> list[str]:
     return [
         row.symbol for row in
@@ -320,6 +327,62 @@ def _delete_sim_runs_for_rerun(
     return len(run_ids)
 
 
+def _log_sim_date_diagnostics(db, model_version: str, today: date) -> None:
+    """Log why step 9b may have no eligible sim_date (horizon targets vs market bars)."""
+    row = db.execute(
+        text("""
+            SELECT COUNT(*)::int, MIN(p.target_date), MAX(p.target_date)
+            FROM predictions p
+            WHERE p.model_version = :mv
+        """),
+        {"mv": model_version},
+    ).fetchone()
+    if not row or row[0] == 0:
+        logger.info(
+            "  Diagnostic: no predictions rows for model_version=%s "
+            "(run step 6 batch predict after promoting)",
+            model_version,
+        )
+        return
+    n, mn, mx = int(row[0]), row[1], row[2]
+    max_past = db.execute(
+        text("""
+            SELECT MAX(p.target_date)
+            FROM predictions p
+            WHERE p.model_version = :mv AND p.target_date <= :today
+        """),
+        {"mv": model_version, "today": today},
+    ).scalar()
+    logger.info(
+        "  Diagnostic: predictions for %s: count=%s, target_date in [%s .. %s], "
+        "MAX(target_date) <= today (%s) = %s",
+        model_version,
+        n,
+        mn,
+        mx,
+        today,
+        max_past,
+    )
+    if max_past is None:
+        logger.info(
+            "  Reason: every prediction.target_date is still in the future vs this run "
+            "(batch predict uses horizon, e.g. T+5). Simulations only run once some "
+            "target_date is <= calendar date — typically ~5 trading days after the "
+            "first batch predict for this model_version."
+        )
+        return
+    has_bar = db.execute(
+        text("SELECT EXISTS (SELECT 1 FROM market_bars_daily mb WHERE mb.date = :d)"),
+        {"d": max_past},
+    ).scalar()
+    if not has_bar:
+        logger.info(
+            "  Reason: market_bars_daily has no row for date=%s (needed for max past "
+            "target_date). Check market ingestion for that session.",
+            max_past,
+        )
+
+
 def step_9b_db_simulations(db):
     """Persist daily simulation runs (legacy + strategy framework) to DB."""
     from src.models.schema import SimulationRun
@@ -361,10 +424,11 @@ def step_9b_db_simulations(db):
 
         if not sim_date:
             logger.info(
-                "  DB simulation skipped: no eligible target_date with predictions "
-                "for production model_version=%s (run batch predict after promoting)",
-                model_version,
+                "  DB simulation skipped: no eligible sim_date "
+                "(need predictions.target_date <= today + market_bars for that date; "
+                "see diagnostic below)",
             )
+            _log_sim_date_diagnostics(db, model_version, date.today())
             return
 
         logger.info(
@@ -498,17 +562,17 @@ def step_10_ingest_fundamentals(db):
     """Ingest fundamental features (SEC EDGAR / yfinance / SimFin). Monday only."""
     if not _should_run_fundamentals_today():
         logger.info(
-            "Step 10: Skipping fundamentals (not Monday — set FUNDAMENTALS_FORCE_RUN=1 to override)"
+            "Step 11: Skipping fundamentals (not Monday — set FUNDAMENTALS_FORCE_RUN=1 to override)"
         )
         return
     if not _fundamentals_ingest_allowed_in_ci():
         logger.info(
-            "Step 10: Skipping fundamentals in GitHub Actions "
+            "Step 11: Skipping fundamentals in GitHub Actions "
             "(set FUNDAMENTALS_INGEST_IN_CI=1 or run .github/workflows/fundamentals-pipeline.yml)"
         )
         return
     from src.pipelines.ingest_fundamentals import ingest_fundamentals
-    logger.info("Step 10: Ingesting fundamental features")
+    logger.info("Step 11: Ingesting fundamental features")
     try:
         symbols = _get_active_symbols(db)
         lookback = max(1, int(os.getenv("FUNDAMENTAL_LOOKBACK_YEARS", "2")))
@@ -561,7 +625,7 @@ def main():
 
             step_t0 = time.time()
             step_fn(db)
-            logger.info(f"  Step {i} took {time.time() - step_t0:.1f}s")
+            logger.info(f"  Step {_cli_step_label(i)} took {time.time() - step_t0:.1f}s")
 
     finally:
         db.close()

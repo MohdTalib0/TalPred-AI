@@ -295,6 +295,7 @@ Non-overlapping samples (stride=5) eliminate autocorrelated targets for honest e
 
 ## Known Limitations
 
+- **Step 9b DB simulations**: `simulation_runs` are only written when there is an eligible `predictions.target_date` (model horizon, e.g. T+5) that is **on or before** the pipeline run date **and** `market_bars_daily` has that session. After promoting a new `model_version`, the first rows may all be **future** horizons — expect **~5 trading days** before simulations appear; logs include a diagnostic if skipped.
 - **Single production model**: ensemble available but strategies currently share one alpha source
 - **Fundamental coverage**: SEC EDGAR covers all US-listed filers; yfinance fills gaps; SimFin optional
 - **7-year default backtest**: covers COVID crash + 2022 rate shock; extend with `--years 10` for deeper history
