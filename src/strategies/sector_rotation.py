@@ -35,7 +35,7 @@ class SectorRotation(BaseStrategy):
 
         if "sector" not in predictions_df.columns:
             merged = predictions_df.merge(
-                features_df[["symbol", "sector_momentum_rank"]].drop_duplicates("symbol"),
+                features_df[["symbol", "sector", "sector_momentum_rank"]].drop_duplicates("symbol"),
                 on="symbol",
                 how="left",
             )

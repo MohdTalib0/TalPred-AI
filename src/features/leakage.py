@@ -244,6 +244,7 @@ def build_training_dataset(
         SELECT
             fs.symbol,
             fs.target_session_date,
+            fs.as_of_time,
             s.sector,
             fs.rsi_14,
             fs.momentum_5d,
@@ -312,7 +313,7 @@ def build_training_dataset(
         return pd.DataFrame()
 
     columns = [
-        "symbol", "target_session_date", "sector",
+        "symbol", "target_session_date", "as_of_time", "sector",
         "rsi_14", "momentum_5d", "momentum_10d", "momentum_20d", "momentum_60d", "momentum_120d",
         "rolling_return_5d", "rolling_return_20d", "rolling_volatility_20d",
         "macd", "macd_signal", "short_term_reversal",
@@ -394,8 +395,11 @@ def build_training_dataset(
     df["vol_adj_momentum_60d"] = df["momentum_60d"] / vol_20
 
     df_sorted = df.sort_values(["symbol", "target_session_date"])
+    # Require a full 252-bar history for a meaningful 52-week high.
+    # min_periods=60 was too loose — stocks with only 60 bars of history
+    # produced inflated pct_from_52w_high values (60-bar high ≠ 52-week high).
     df["high_52w"] = df_sorted.groupby("symbol")["close"].transform(
-        lambda x: x.rolling(252, min_periods=60).max()
+        lambda x: x.rolling(252, min_periods=252).max()
     )
     df["pct_from_52w_high"] = df["close"] / df["high_52w"].clip(lower=0.01)
     df = df.drop(columns=["high_52w"])
@@ -503,7 +507,22 @@ def build_training_dataset(
     if include_liquidity_features and "log_market_cap" in df.columns:
         df = _add_flow_residuals(df, flow_resid_cols, size_col="log_market_cap")
 
-    df = df.drop(columns=[c for c in ["market_cap", "avg_daily_volume_30d", "close", "volume"] if c in df.columns])
+    # Leakage guard: feature snapshots must not have been written after their
+    # own target_session_date. If as_of_time > target_session_date, the snapshot
+    # was computed using data from a future session — look-ahead bias.
+    if "as_of_time" in df.columns:
+        aot = pd.to_datetime(df["as_of_time"], utc=True).dt.date
+        tsd = pd.to_datetime(df["target_session_date"]).dt.date
+        leaky = df[aot > tsd]
+        if not leaky.empty:
+            sample = leaky[["symbol", "target_session_date", "as_of_time"]].head(5).to_dict("records")
+            raise ValueError(
+                f"Leakage detected: {len(leaky)} rows where as_of_time > target_session_date "
+                f"(feature snapshot written after its own feature date). "
+                f"Sample rows: {sample}"
+            )
+
+    df = df.drop(columns=[c for c in ["market_cap", "avg_daily_volume_30d", "close", "volume", "as_of_time"] if c in df.columns])
 
     # Optionally merge fundamental features (SUE, accruals, margins, etc.)
     if include_fundamentals:
@@ -534,7 +553,11 @@ def build_training_dataset(
 
 
 def validate_no_leakage(df: pd.DataFrame) -> dict:
-    """Run leakage checks on a training dataset.
+    """Run structural leakage checks on a training dataset.
+
+    Note: the as_of_time > target_session_date check is enforced at build time
+    inside build_training_dataset() (raises ValueError). This function checks
+    post-build structural invariants on the returned feature matrix.
 
     Returns dict with check results and any violations found.
     """

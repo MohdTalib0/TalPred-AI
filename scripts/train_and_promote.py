@@ -321,8 +321,8 @@ def main():
         prod_dir = os.path.join("artifacts", "production_model")
         os.makedirs(prod_dir, exist_ok=True)
         train_result["model"].save_model(os.path.join(prod_dir, "model.json"))
-        with open(os.path.join(prod_dir, "train_medians.pkl"), "wb") as f:
-            pickle.dump(train_result["train_medians"], f)
+        with open(os.path.join(prod_dir, "train_medians.json"), "w") as f:
+            json.dump(train_result["train_medians"].to_dict(), f)
         with open(os.path.join(prod_dir, "metadata.json"), "w") as f:
             json.dump({
                 "model_version": model_version,

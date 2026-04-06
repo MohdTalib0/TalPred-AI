@@ -197,6 +197,16 @@ def run_strategy_simulation(
                 if factor_model is not None:
                     risk_mgr.set_factor_model(factor_model)
                     logger.info("Factor model rebuilt as of %s", td)
+                else:
+                    # Explicitly clear the old model so stale factor constraints
+                    # are not silently applied. set_factor_model(None) also sets
+                    # factor_constraint_enabled = False.
+                    risk_mgr.set_factor_model(None)
+                    logger.warning(
+                        "Factor model rebuild failed as of %s — "
+                        "factor constraints disabled until next successful build",
+                        td,
+                    )
                 _days_since_factor_build = 0
 
             vix = _get_vix(day_features)
@@ -305,6 +315,18 @@ def run_strategy_simulation(
         equity_curve, daily_returns, all_trades, cfg.starting_capital, benchmark_returns,
         realized_position_pnls=realized_position_pnls,
     )
+
+    # Compute forward_win_rate from realized_return populated by outcome_backfill.
+    # win_rate above is always 0 for single-day sims (no hold period); this metric
+    # is non-null once outcome_backfill runs (~5 trading days later).
+    realized = predictions_df[predictions_df["realized_return"].notna()].copy()
+    if not realized.empty:
+        realized["correct"] = (
+            ((realized["direction"] == "up") & (realized["realized_return"] > 0))
+            | ((realized["direction"] == "down") & (realized["realized_return"] < 0))
+        )
+        metrics["forward_win_rate"] = round(float(realized["correct"].mean()), 4)
+        metrics["forward_win_rate_n"] = int(len(realized))
 
     if daily_turnovers:
         metrics["avg_rebalance_turnover"] = round(float(np.mean(daily_turnovers)), 4)
@@ -601,7 +623,7 @@ def _load_predictions(
     if not rows:
         return pd.DataFrame()
 
-    return pd.DataFrame(
+    df = pd.DataFrame(
         rows,
         columns=[
             "symbol",
@@ -614,6 +636,12 @@ def _load_predictions(
             "realized_return",
         ],
     )
+    # Normalize market-relative direction labels → strategy-canonical labels.
+    # The production model uses "outperform"/"underperform"; strategies expect "up"/"down".
+    df["direction"] = df["direction"].replace(
+        {"outperform": "up", "underperform": "down"}
+    )
+    return df
 
 
 def _load_features(

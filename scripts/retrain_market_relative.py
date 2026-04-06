@@ -470,8 +470,8 @@ def main():
         else:
             with open(os.path.join(prod_dir, "model_ensemble.pkl"), "wb") as f:
                 pickle.dump(model_obj, f)
-        with open(os.path.join(prod_dir, "train_medians.pkl"), "wb") as f:
-            pickle.dump(train_result["train_medians"], f)
+        with open(os.path.join(prod_dir, "train_medians.json"), "w") as f:
+            json.dump(train_result["train_medians"].to_dict(), f)
         with open(os.path.join(prod_dir, "metadata.json"), "w") as f:
             json.dump({
                 "model_version": model_version,

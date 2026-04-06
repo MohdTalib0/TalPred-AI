@@ -12,7 +12,6 @@ import hashlib
 import json
 import logging
 import os
-import pickle
 from datetime import UTC, date, datetime, timedelta
 
 import mlflow
@@ -34,7 +33,7 @@ logger = logging.getLogger(__name__)
 TOP_K_FACTORS = 5
 LOCAL_PROD_MODEL_PATH = os.path.join("artifacts", "production_model", "model.json")
 LOCAL_PROD_MEDIANS_PATH = os.path.join(
-    "artifacts", "production_model", "train_medians.pkl"
+    "artifacts", "production_model", "train_medians.json"
 )
 LOCAL_PROD_METADATA_PATH = os.path.join(
     "artifacts", "production_model", "metadata.json"
@@ -289,14 +288,28 @@ def _load_target_mode() -> str:
 
 def _load_local_train_medians() -> pd.Series | None:
     if not os.path.exists(LOCAL_PROD_MEDIANS_PATH):
+        # Fallback: support legacy .pkl files left over from before the JSON migration
+        legacy_path = LOCAL_PROD_MEDIANS_PATH.replace(".json", ".pkl")
+        if os.path.exists(legacy_path):
+            logger.warning(
+                "Found legacy train_medians.pkl — please re-run training to generate "
+                "train_medians.json. Loading pickle as fallback (remove after migration)."
+            )
+            try:
+                import pickle as _pickle
+                with open(legacy_path, "rb") as f:
+                    med = _pickle.load(f)
+                if isinstance(med, pd.Series):
+                    return med
+                if isinstance(med, dict):
+                    return pd.Series(med)
+            except Exception:
+                logger.warning("Failed to load legacy train_medians.pkl")
         return None
     try:
-        with open(LOCAL_PROD_MEDIANS_PATH, "rb") as f:
-            med = pickle.load(f)
-        if isinstance(med, pd.Series):
-            return med
-        if isinstance(med, dict):
-            return pd.Series(med)
+        with open(LOCAL_PROD_MEDIANS_PATH) as f:
+            med = json.load(f)
+        return pd.Series(med, dtype=float)
     except Exception:
         logger.warning("Failed to load local train medians, using inference medians")
     return None
@@ -336,14 +349,20 @@ def _compute_alpha_features(
         if "vol_adj_momentum_60d" not in inf_df.columns and "momentum_60d" in inf_df.columns:
             inf_df["vol_adj_momentum_60d"] = inf_df["momentum_60d"] / vol20
 
-    # 52-week high proximity — query 252-day max close per symbol
+    # 52-week high proximity — query 252-day max adj_close per symbol.
+    # Use adj_close (not close) so stock splits don't inflate the 52-week high.
+    # Require at least 252 bars of history; symbols with less history get NaN
+    # to match training-time behaviour in leakage.py (min_periods=252).
     if "pct_from_52w_high" not in inf_df.columns:
         high52_rows = db.execute(
             text("""
-                SELECT symbol, MAX(close) AS high_52w
+                SELECT symbol,
+                       MAX(adj_close) AS high_52w,
+                       COUNT(*)       AS bar_count
                 FROM market_bars_daily
                 WHERE date >= :start AND date <= :end
                   AND symbol = ANY(:syms)
+                  AND adj_close IS NOT NULL
                 GROUP BY symbol
             """),
             {
@@ -353,7 +372,11 @@ def _compute_alpha_features(
             },
         ).fetchall()
         if high52_rows:
-            h52 = pd.DataFrame(high52_rows, columns=["symbol", "high_52w"])
+            h52 = pd.DataFrame(high52_rows, columns=["symbol", "high_52w", "bar_count"])
+            # Null out symbols with fewer than 252 bars — not enough history
+            # for a meaningful 52-week high (matches leakage.py min_periods=252)
+            h52.loc[h52["bar_count"] < 252, "high_52w"] = float("nan")
+            h52 = h52.drop(columns=["bar_count"])
             inf_df = inf_df.merge(h52, on="symbol", how="left")
             # Use the snapshot's close or the latest market close for the ratio
             close_col = "close" if "close" in inf_df.columns else None

@@ -29,14 +29,13 @@ class RiskManager:
         self._factor_model = factor_model
 
     def set_factor_model(self, factor_model) -> None:
-        """Attach a fitted StatisticalFactorModel for factor constraints.
+        """Attach (or clear) a fitted StatisticalFactorModel for factor constraints.
 
-        Automatically enables factor_constraint_enabled when a model is
-        attached, so callers don't need to remember to flip the flag.
+        Passing None explicitly disables factor constraints so that a failed
+        rebuild doesn't silently keep applying a stale model.
         """
         self._factor_model = factor_model
-        if factor_model is not None:
-            self.cfg.factor_constraint_enabled = True
+        self.cfg.factor_constraint_enabled = factor_model is not None
 
     def apply(
         self,

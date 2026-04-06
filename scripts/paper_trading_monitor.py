@@ -65,12 +65,12 @@ PROD_MODEL_DIR = os.path.join("artifacts", "production_model")
 def _get_production_model():
     """Load the exact production model from local artifact.
 
-    train_and_promote saves model.json + train_medians.pkl + metadata.json
+    train_and_promote saves model.json + train_medians.json + metadata.json
     locally after every training run. This ensures paper trading uses the
     exact same model that was promoted — no retraining, no DagHub download.
     """
     model_path = os.path.join(PROD_MODEL_DIR, "model.json")
-    medians_path = os.path.join(PROD_MODEL_DIR, "train_medians.pkl")
+    medians_path = os.path.join(PROD_MODEL_DIR, "train_medians.json")
     metadata_path = os.path.join(PROD_MODEL_DIR, "metadata.json")
 
     if not os.path.exists(model_path):
@@ -80,7 +80,6 @@ def _get_production_model():
         )
 
     import json
-    import pickle
     import xgboost as xgb
 
     # Load metadata
@@ -97,8 +96,8 @@ def _get_production_model():
     model.load_model(model_path)
 
     # Load training medians (for NaN filling)
-    with open(medians_path, "rb") as f:
-        train_medians = pickle.load(f)
+    with open(medians_path) as f:
+        train_medians = pd.Series(json.load(f), dtype=float)
 
     logger.info(f"  Loaded production model from {PROD_MODEL_DIR}/")
     return model, train_medians, meta
