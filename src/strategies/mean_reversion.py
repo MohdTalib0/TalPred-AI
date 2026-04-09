@@ -7,12 +7,15 @@ than the other modes but with higher per-trade conviction.
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import pandas as pd
 
 from src.strategies.base import BaseStrategy, Signal
 from src.strategies.config import MeanReversionConfig
+
+logger = logging.getLogger(__name__)
 
 
 class MeanReversion(BaseStrategy):
@@ -41,28 +44,43 @@ class MeanReversion(BaseStrategy):
         )
 
         signals: list[Signal] = []
+        n_has_rsi = 0
+        n_has_reversal = 0
+        n_rsi_extreme = 0
+        n_direction_match = 0
+
         for _, row in merged.iterrows():
             rsi = row.get("rsi_14")
             reversal = row.get("short_term_reversal")
 
             if rsi is None or pd.isna(rsi):
                 continue
+            n_has_rsi += 1
             if reversal is None or pd.isna(reversal):
                 continue
+            n_has_reversal += 1
 
             direction = row["direction"]
             reversal_pct = reversal * 100 if abs(reversal) < 1 else reversal
 
+            rsi_oversold = rsi < self.cfg.rsi_oversold
+            rsi_overbought = rsi > self.cfg.rsi_overbought
+            if rsi_oversold or rsi_overbought:
+                n_rsi_extreme += 1
+
             is_long = (
                 direction == "up"
-                and rsi < self.cfg.rsi_oversold
+                and rsi_oversold
                 and reversal_pct < -self.cfg.reversal_threshold_pct
             )
             is_short = (
                 direction == "down"
-                and rsi > self.cfg.rsi_overbought
+                and rsi_overbought
                 and reversal_pct > self.cfg.reversal_threshold_pct
             )
+
+            if is_long or is_short:
+                n_direction_match += 1
 
             if not is_long and not is_short:
                 continue
@@ -86,6 +104,13 @@ class MeanReversion(BaseStrategy):
                     },
                 )
             )
+
+        logger.info(
+            "MeanReversion filter funnel: %d confident → %d has_rsi → "
+            "%d has_reversal → %d rsi_extreme → %d direction_match → %d signals",
+            len(preds), n_has_rsi, n_has_reversal, n_rsi_extreme,
+            n_direction_match, len(signals),
+        )
 
         signals.sort(key=lambda s: abs(s.raw_score), reverse=True)
         return signals[: self.cfg.max_picks]

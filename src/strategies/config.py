@@ -84,9 +84,9 @@ class SectorRotationConfig:
 @dataclass
 class MeanReversionConfig:
     min_confidence: float = 0.55
-    rsi_oversold: float = 30.0
-    rsi_overbought: float = 70.0
-    reversal_threshold_pct: float = 2.0
+    rsi_oversold: float = 40.0
+    rsi_overbought: float = 60.0
+    reversal_threshold_pct: float = 1.0
     max_picks: int = 10
 
 

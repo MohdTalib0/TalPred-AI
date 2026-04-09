@@ -319,14 +319,23 @@ def run_strategy_simulation(
     # Compute forward_win_rate from realized_return populated by outcome_backfill.
     # win_rate above is always 0 for single-day sims (no hold period); this metric
     # is non-null once outcome_backfill runs (~5 trading days later).
-    realized = predictions_df[predictions_df["realized_return"].notna()].copy()
-    if not realized.empty:
-        realized["correct"] = (
-            ((realized["direction"] == "up") & (realized["realized_return"] > 0))
-            | ((realized["direction"] == "down") & (realized["realized_return"] < 0))
+    # Only count predictions the strategy actually traded (per-strategy accuracy).
+    traded_symbols = {t["symbol"] for t in all_trades}
+    if traded_symbols:
+        traded_preds = predictions_df[
+            (predictions_df["symbol"].isin(traded_symbols))
+            & (predictions_df["realized_return"].notna())
+        ].copy()
+    else:
+        traded_preds = predictions_df[predictions_df["realized_return"].notna()].copy()
+
+    if not traded_preds.empty:
+        traded_preds["correct"] = (
+            ((traded_preds["direction"] == "up") & (traded_preds["realized_return"] > 0))
+            | ((traded_preds["direction"] == "down") & (traded_preds["realized_return"] < 0))
         )
-        metrics["forward_win_rate"] = round(float(realized["correct"].mean()), 4)
-        metrics["forward_win_rate_n"] = int(len(realized))
+        metrics["forward_win_rate"] = round(float(traded_preds["correct"].mean()), 4)
+        metrics["forward_win_rate_n"] = int(len(traded_preds))
 
     if daily_turnovers:
         metrics["avg_rebalance_turnover"] = round(float(np.mean(daily_turnovers)), 4)
